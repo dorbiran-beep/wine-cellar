@@ -1,13 +1,11 @@
 // Serverless function that proxies requests to Claude API.
-// The API key is read from environment variables (set in Vercel dashboard).
 
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '10mb' // images can be a few MB after base64 encoding
+      sizeLimit: '4.5mb'
     }
-  },
-  maxDuration: 60 // allow up to 60 seconds for Claude responses
+  }
 };
 
 export default async function handler(req, res) {
