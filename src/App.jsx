@@ -13,6 +13,8 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisStatus, setAnalysisStatus] = useState('');
   const [loaded, setLoaded] = useState(false);
+  const [unrecognizedImage, setUnrecognizedImage] = useState(null);
+  const [wineToReidentify, setWineToReidentify] = useState(null);
 
   useEffect(() => {
     try {
@@ -119,13 +121,15 @@ export default function App() {
     setDebugInfo(null);
     setAnalysisStatus(mode === 'invoice' ? 'קורא את החשבונית...' : 'מזהה את הבקבוקים...');
     try {
-      const imageContents = await Promise.all(Array.from(files).map(async (file) => {
+      // Process images and keep both the small API version and a display version
+      const processedImages = await Promise.all(Array.from(files).map(async (file) => {
         const processed = await processImageForAPI(file);
         return {
-          type: 'image',
-          source: { type: 'base64', media_type: processed.media_type, data: processed.data }
+          apiSource: { type: 'base64', media_type: processed.media_type, data: processed.data },
+          displayDataUrl: 'data:image/jpeg;base64,' + processed.data
         };
       }));
+      const imageContents = processedImages.map(p => ({ type: 'image', source: p.apiSource }));
 
       const prompt = mode === 'invoice'
         ? `This is a wine purchase invoice (may be in Hebrew, English, or another language). Your job is to extract EVERY wine listed in the invoice table.
@@ -138,17 +142,26 @@ For each row in the invoice that represents a wine product:
 - Use your knowledge to determine the wine type, grape, and region based on the name
 
 Return ONLY valid JSON in this exact format (no markdown, no comments, no trailing commas):
-{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2018,"type":"red","grape":"Nebbiolo","region":"Piedmont, Italy","quantity":2,"price":148.31,"currency":"ILS"}]}
+{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2018,"type":"red","grape":"Nebbiolo","region":"Piedmont, Italy","quantity":2,"price":148.31,"currency":"ILS","confidence":"high"}]}
 
 type must be one of: red, white, rose, sparkling, dessert, fortified
+confidence must be: "high" (clearly read), "medium" (partial info), or "low" (guessing).
 If invoice is in Israeli shekels use currency "ILS".
 Extract ALL wines in the invoice, not just some.`
         : `This is a photo of wine bottle(s). Identify each bottle visible.
 
-Return ONLY valid JSON (no markdown):
-{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית"}]}
+IMPORTANT rules:
+- Only identify wines you can actually read from the label or recognize with high confidence
+- If the label is blurry, occluded, or you can't read the wine name clearly — return confidence:"low" and include any text you CAN see (even partial) in "partialText"
+- Never invent a wine name. If unsure, say so with low confidence.
+- If you recognize the producer/winery but not the specific wine name, still return it with medium confidence
 
-type must be one of: red, white, rose, sparkling, dessert, fortified`;
+Return ONLY valid JSON (no markdown):
+{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית","confidence":"high","partialText":"any text you can read from the label, even if you cant identify the wine"}]}
+
+type must be one of: red, white, rose, sparkling, dessert, fortified.
+confidence must be: "high", "medium", or "low".
+If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,"partialText":"any text visible on the label"}.`;
 
       const result = await callClaude([{ role: 'user', content: [...imageContents, { type: 'text', text: prompt }] }], 2000);
       console.log('Raw AI response:', result);
@@ -168,16 +181,35 @@ type must be one of: red, white, rose, sparkling, dessert, fortified`;
         throw new Error('לא הצלחתי לפענח את התוצאה. נסה תמונה ברורה יותר.');
       }
 
-      if (!parsed.wines || !Array.isArray(parsed.wines) || parsed.wines.length === 0) {
-        throw new Error('לא זוהו יינות בתמונה. נסה תמונה ברורה יותר.');
+      // Handle the "no recognition" case
+      if (parsed.noRecognition || !parsed.wines || parsed.wines.length === 0) {
+        setIsAnalyzing(false);
+        setUnrecognizedImage({
+          dataUrl: processedImages[0]?.displayDataUrl,
+          partialText: parsed.partialText || ''
+        });
+        return;
       }
 
-      // Add wines immediately without enrichment so user sees results fast
+      // Check if any wine has low confidence - show picker for that too
+      const hasLowConfidence = mode === 'photo' && parsed.wines.some(w => w.confidence === 'low');
+      if (hasLowConfidence && parsed.wines.length === 1) {
+        setIsAnalyzing(false);
+        setUnrecognizedImage({
+          dataUrl: processedImages[0]?.displayDataUrl,
+          partialText: parsed.wines[0].partialText || parsed.wines[0].name || '',
+          uncertainWine: parsed.wines[0]
+        });
+        return;
+      }
+
+      // Add wines immediately with the photo attached
       const newWines = parsed.wines.map((w, i) => ({
         ...w,
         id: Date.now() + Math.random() + i,
         addedAt: new Date().toISOString(),
         quantity: w.quantity || 1,
+        labelImage: mode === 'photo' ? processedImages[Math.min(i, processedImages.length - 1)]?.displayDataUrl : null,
         _enriching: true
       }));
       setWines(prev => [...newWines, ...prev]);
@@ -185,7 +217,7 @@ type must be one of: red, white, rose, sparkling, dessert, fortified`;
       setAddMode(null);
       setShowAddMenu(false);
 
-      // Enrich in background, one at a time (doesn't block UI, doesn't fail together)
+      // Enrich in background, one at a time
       for (const wine of newWines) {
         try {
           const extra = await enrichWine(wine);
@@ -212,6 +244,54 @@ type must be one of: red, white, rose, sparkling, dessert, fortified`;
     setIsAnalyzing(false);
     setAddMode(null);
     setShowAddMenu(false);
+  };
+
+  // User confirmed a chosen wine from the "help identify" flow
+  const confirmIdentifiedWine = async (wineData, labelImage) => {
+    setUnrecognizedImage(null);
+    const newWine = {
+      ...wineData,
+      id: Date.now() + Math.random(),
+      addedAt: new Date().toISOString(),
+      quantity: wineData.quantity || 1,
+      labelImage,
+      _enriching: true
+    };
+    setWines(prev => [newWine, ...prev]);
+    setAddMode(null);
+    setShowAddMenu(false);
+
+    try {
+      const extra = await enrichWine(newWine);
+      setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, ...extra, _enriching: false } : w));
+    } catch (e) {
+      setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, _enriching: false } : w));
+    }
+  };
+
+  // User picks a replacement wine to replace one that was misidentified
+  const replaceWine = async (oldWineId, newWineData) => {
+    setWineToReidentify(null);
+    const labelImage = wines.find(w => w.id === oldWineId)?.labelImage;
+    const replacement = {
+      ...newWineData,
+      id: oldWineId,
+      addedAt: new Date().toISOString(),
+      quantity: newWineData.quantity || 1,
+      labelImage,
+      _enriching: true
+    };
+    setWines(prev => prev.map(w => w.id === oldWineId ? replacement : w));
+    if (selectedWine?.id === oldWineId) setSelectedWine(replacement);
+
+    try {
+      const extra = await enrichWine(replacement);
+      const enriched = { ...replacement, ...extra, _enriching: false };
+      setWines(prev => prev.map(w => w.id === oldWineId ? enriched : w));
+      if (selectedWine?.id === oldWineId) setSelectedWine(enriched);
+    } catch (e) {
+      setWines(prev => prev.map(w => w.id === oldWineId ? { ...replacement, _enriching: false } : w));
+    }
   };
 
   const importFromTable = async (rows, shouldEnrich) => {
@@ -353,7 +433,7 @@ type must be one of: red, white, rose, sparkling, dessert, fortified`;
 
       <main className="max-w-6xl mx-auto px-5 py-6 relative">
         {selectedWine ? (
-          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
+          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} onReidentify={() => setWineToReidentify(selectedWine)} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
         ) : view === 'cellar' ? (
           <CellarView wines={filteredWines} allWines={wines} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} sortBy={sortBy} setSortBy={setSortBy} onSelectWine={setSelectedWine} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} onOpenAdd={() => setShowAddMenu(true)} />
         ) : view === 'recommendations' ? (
@@ -389,6 +469,28 @@ type must be one of: red, white, rose, sparkling, dessert, fortified`;
       {addMode === 'table' && (
         <Modal onClose={() => { setAddMode(null); setShowAddMenu(false); }} title="ייבוא מטבלה">
           <TableImport onImport={importFromTable} isAnalyzing={isAnalyzing} status={analysisStatus} />
+        </Modal>
+      )}
+
+      {unrecognizedImage && (
+        <Modal onClose={() => { setUnrecognizedImage(null); setAddMode(null); setShowAddMenu(false); }} title="זיהוי היין">
+          <UnrecognizedHelper
+            image={unrecognizedImage}
+            onConfirm={confirmIdentifiedWine}
+            onCancel={() => { setUnrecognizedImage(null); setAddMode(null); setShowAddMenu(false); }}
+            callClaude={callClaude}
+          />
+        </Modal>
+      )}
+
+      {wineToReidentify && (
+        <Modal onClose={() => setWineToReidentify(null)} title="בחירת יין נכון">
+          <ReidentifyHelper
+            wine={wineToReidentify}
+            onReplace={(newData) => replaceWine(wineToReidentify.id, newData)}
+            onCancel={() => setWineToReidentify(null)}
+            callClaude={callClaude}
+          />
         </Modal>
       )}
     </div>
@@ -460,25 +562,29 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
       boxShadow: '0 1px 3px rgba(0,0,0,0.04), 0 4px 20px rgba(0,0,0,0.03)',
       animation: 'slideUp 0.5s ' + (index * 0.04) + 's both cubic-bezier(0.2, 0.9, 0.3, 1)'
     }}>
-      <div className={"relative h-40 bg-gradient-to-b " + colors.bg + " overflow-hidden flex items-end justify-center"}>
-        <div className="relative" style={{ width: '50px', height: '130px' }}>
-          <div className="absolute top-0 left-1/2 -translate-x-1/2 w-3 h-8 rounded-t-sm" style={{ background: 'rgba(0,0,0,0.4)' }} />
-          <div className="absolute top-2 left-1/2 -translate-x-1/2 w-4 h-3" style={{ background: 'rgba(0,0,0,0.5)', borderRadius: '2px' }} />
-          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-12 rounded-b-sm" style={{
-            height: '100px',
-            background: 'linear-gradient(180deg, rgba(0,0,0,0.5) 0%, rgba(0,0,0,0.35) 100%)',
-            boxShadow: 'inset 2px 0 4px rgba(255,255,255,0.1), inset -2px 0 4px rgba(0,0,0,0.3)'
-          }}>
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 w-10 h-16 rounded flex flex-col items-center justify-center px-0.5 text-center" style={{
-              background: 'linear-gradient(180deg, #f5efe0, #e8dfc8)',
-              boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+      <div className={"relative h-40 overflow-hidden flex items-end justify-center " + (wine.labelImage ? 'bg-gray-100' : 'bg-gradient-to-b ' + colors.bg)}>
+        {wine.labelImage ? (
+          <img src={wine.labelImage} alt={wine.name} className="absolute inset-0 w-full h-full object-cover" />
+        ) : (
+          <div className="relative" style={{ width: '50px', height: '130px' }}>
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-3 h-8 rounded-t-sm" style={{ background: 'rgba(0,0,0,0.4)' }} />
+            <div className="absolute top-2 left-1/2 -translate-x-1/2 w-4 h-3" style={{ background: 'rgba(0,0,0,0.5)', borderRadius: '2px' }} />
+            <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-12 rounded-b-sm" style={{
+              height: '100px',
+              background: 'linear-gradient(180deg, rgba(0,0,0,0.5) 0%, rgba(0,0,0,0.35) 100%)',
+              boxShadow: 'inset 2px 0 4px rgba(255,255,255,0.1), inset -2px 0 4px rgba(0,0,0,0.3)'
             }}>
-              <div className="text-[6px] font-bold leading-tight" style={{ color: colors.accent }}>{wine.producer?.slice(0, 10) || 'WINE'}</div>
-              <div className="w-6 h-px my-0.5" style={{ background: colors.accent }} />
-              <div className="text-[5px] leading-tight opacity-70" style={{ color: colors.accent }}>{wine.vintage || ''}</div>
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 w-10 h-16 rounded flex flex-col items-center justify-center px-0.5 text-center" style={{
+                background: 'linear-gradient(180deg, #f5efe0, #e8dfc8)',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+              }}>
+                <div className="text-[6px] font-bold leading-tight" style={{ color: colors.accent }}>{wine.producer?.slice(0, 10) || 'WINE'}</div>
+                <div className="w-6 h-px my-0.5" style={{ background: colors.accent }} />
+                <div className="text-[5px] leading-tight opacity-70" style={{ color: colors.accent }}>{wine.vintage || ''}</div>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {status && (
           <div className="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-full text-[10px] font-semibold backdrop-blur-lg border border-white/20" style={{ background: status.color + 'dd', color: 'white' }}>
@@ -486,7 +592,7 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
           </div>
         )}
 
-        <div className="absolute top-2.5 left-2.5 min-w-[26px] h-[22px] px-1.5 rounded-full backdrop-blur-lg flex items-center justify-center text-[11px] font-bold text-white border border-white/20" style={{ background: 'rgba(0,0,0,0.4)' }}>
+        <div className="absolute top-2.5 left-2.5 min-w-[26px] h-[22px] px-1.5 rounded-full backdrop-blur-lg flex items-center justify-center text-[11px] font-bold text-white border border-white/20" style={{ background: 'rgba(0,0,0,0.55)' }}>
           ×{wine.quantity || 1}
         </div>
 
@@ -517,7 +623,7 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
   );
 }
 
-function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, getDrinkStatus, getWineColor, translateType }) {
+function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, getDrinkStatus, getWineColor, translateType }) {
   const status = getDrinkStatus(wine);
   const colors = getWineColor(wine.type);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -528,50 +634,85 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, getDrinkStatus, 
         <span style={{ transform: 'rotate(180deg)', display: 'inline-block' }}>‹</span> חזרה למרתף
       </button>
 
-      <div className={"relative rounded-3xl overflow-hidden mb-5 bg-gradient-to-br " + colors.bg} style={{ minHeight: '260px', boxShadow: '0 10px 40px rgba(0,0,0,0.15)' }}>
-        <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse at top, rgba(255,255,255,0.15), transparent 70%)' }} />
+      {wine.labelImage ? (
+        // Real photo hero
+        <div className="relative rounded-3xl overflow-hidden mb-5" style={{ boxShadow: '0 10px 40px rgba(0,0,0,0.15)', aspectRatio: '4/5', maxHeight: '480px' }}>
+          <img src={wine.labelImage} alt={wine.name} className="w-full h-full object-cover" />
+          <div className="absolute inset-0" style={{ background: 'linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.4) 70%, rgba(0,0,0,0.85) 100%)' }} />
+          <div className="absolute bottom-0 left-0 right-0 p-6 text-white">
+            {status && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold mb-3 backdrop-blur-md border border-white/20" style={{ background: 'rgba(255,255,255,0.18)' }}>
+                <div className="w-1.5 h-1.5 rounded-full" style={{ background: status.color }} />
+                {status.label}
+              </div>
+            )}
+            <h1 className="text-2xl md:text-3xl font-bold mb-1 leading-tight drop-shadow-lg">{wine.name}</h1>
+            <p className="text-[15px] opacity-90 mb-3 drop-shadow">{wine.producer}</p>
+            <div className="flex flex-wrap gap-2 text-[12px]">
+              {wine.vintage && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.15)' }}>{wine.vintage}</div>}
+              {wine.type && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.15)' }}>{translateType(wine.type)}</div>}
+              {wine.grape && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.15)' }}>{wine.grape}</div>}
+              {wine.region && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15 flex items-center gap-1" style={{ background: 'rgba(255,255,255,0.15)' }}>
+                <MapPin className="w-3 h-3" /> {wine.region}
+              </div>}
+            </div>
+          </div>
+        </div>
+      ) : (
+        // Illustrated bottle hero
+        <div className={"relative rounded-3xl overflow-hidden mb-5 bg-gradient-to-br " + colors.bg} style={{ minHeight: '260px', boxShadow: '0 10px 40px rgba(0,0,0,0.15)' }}>
+          <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse at top, rgba(255,255,255,0.15), transparent 70%)' }} />
 
-        <div className="absolute bottom-0 right-8 md:right-16">
-          <div className="relative" style={{ width: '90px', height: '220px' }}>
-            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-5 h-12 rounded-t" style={{ background: 'rgba(0,0,0,0.45)' }} />
-            <div className="absolute top-3 left-1/2 -translate-x-1/2 w-7 h-5" style={{ background: 'rgba(0,0,0,0.55)', borderRadius: '3px' }} />
-            <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-[88px] rounded-b" style={{
-              height: '170px',
-              background: 'linear-gradient(180deg, rgba(0,0,0,0.5), rgba(0,0,0,0.35))',
-              boxShadow: 'inset 3px 0 6px rgba(255,255,255,0.12), inset -3px 0 6px rgba(0,0,0,0.3)'
-            }}>
-              <div className="absolute top-6 left-1/2 -translate-x-1/2 w-16 h-28 rounded flex flex-col items-center justify-center px-1 text-center" style={{
-                background: 'linear-gradient(180deg, #f5efe0, #e8dfc8)',
-                boxShadow: '0 2px 4px rgba(0,0,0,0.25)'
+          <div className="absolute bottom-0 right-8 md:right-16">
+            <div className="relative" style={{ width: '90px', height: '220px' }}>
+              <div className="absolute top-0 left-1/2 -translate-x-1/2 w-5 h-12 rounded-t" style={{ background: 'rgba(0,0,0,0.45)' }} />
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 w-7 h-5" style={{ background: 'rgba(0,0,0,0.55)', borderRadius: '3px' }} />
+              <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-[88px] rounded-b" style={{
+                height: '170px',
+                background: 'linear-gradient(180deg, rgba(0,0,0,0.5), rgba(0,0,0,0.35))',
+                boxShadow: 'inset 3px 0 6px rgba(255,255,255,0.12), inset -3px 0 6px rgba(0,0,0,0.3)'
               }}>
-                <div className="text-[8px] font-bold leading-tight" style={{ color: colors.accent }}>{wine.producer?.slice(0, 14) || ''}</div>
-                <div className="w-10 h-px my-1" style={{ background: colors.accent }} />
-                <div className="text-[7px] leading-tight" style={{ color: colors.accent, opacity: 0.8 }}>{wine.name?.slice(0, 20)}</div>
-                <div className="text-[9px] font-bold mt-1" style={{ color: colors.accent }}>{wine.vintage || ''}</div>
+                <div className="absolute top-6 left-1/2 -translate-x-1/2 w-16 h-28 rounded flex flex-col items-center justify-center px-1 text-center" style={{
+                  background: 'linear-gradient(180deg, #f5efe0, #e8dfc8)',
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.25)'
+                }}>
+                  <div className="text-[8px] font-bold leading-tight" style={{ color: colors.accent }}>{wine.producer?.slice(0, 14) || ''}</div>
+                  <div className="w-10 h-px my-1" style={{ background: colors.accent }} />
+                  <div className="text-[7px] leading-tight" style={{ color: colors.accent, opacity: 0.8 }}>{wine.name?.slice(0, 20)}</div>
+                  <div className="text-[9px] font-bold mt-1" style={{ color: colors.accent }}>{wine.vintage || ''}</div>
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <div className="relative p-6 md:p-8 text-white max-w-[60%]">
-          {status && (
-            <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold mb-3 backdrop-blur-md border border-white/20" style={{ background: 'rgba(255,255,255,0.18)' }}>
-              <div className="w-1.5 h-1.5 rounded-full" style={{ background: status.color }} />
-              {status.label}
+          <div className="relative p-6 md:p-8 text-white max-w-[60%]">
+            {status && (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold mb-3 backdrop-blur-md border border-white/20" style={{ background: 'rgba(255,255,255,0.18)' }}>
+                <div className="w-1.5 h-1.5 rounded-full" style={{ background: status.color }} />
+                {status.label}
+              </div>
+            )}
+            <h1 className="text-2xl md:text-3xl font-bold mb-1 leading-tight">{wine.name}</h1>
+            <p className="text-[15px] opacity-80 mb-3">{wine.producer}</p>
+            <div className="flex flex-wrap gap-2 text-[12px]">
+              {wine.vintage && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{wine.vintage}</div>}
+              {wine.type && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{translateType(wine.type)}</div>}
+              {wine.grape && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{wine.grape}</div>}
+              {wine.region && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15 flex items-center gap-1" style={{ background: 'rgba(255,255,255,0.12)' }}>
+                <MapPin className="w-3 h-3" /> {wine.region}
+              </div>}
             </div>
-          )}
-          <h1 className="text-2xl md:text-3xl font-bold mb-1 leading-tight">{wine.name}</h1>
-          <p className="text-[15px] opacity-80 mb-3">{wine.producer}</p>
-          <div className="flex flex-wrap gap-2 text-[12px]">
-            {wine.vintage && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{wine.vintage}</div>}
-            {wine.type && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{translateType(wine.type)}</div>}
-            {wine.grape && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15" style={{ background: 'rgba(255,255,255,0.12)' }}>{wine.grape}</div>}
-            {wine.region && <div className="px-2.5 py-1 rounded-full backdrop-blur-md border border-white/15 flex items-center gap-1" style={{ background: 'rgba(255,255,255,0.12)' }}>
-              <MapPin className="w-3 h-3" /> {wine.region}
-            </div>}
           </div>
         </div>
-      </div>
+      )}
+
+      {/* Reidentify button - only for wines with a label image */}
+      {wine.labelImage && onReidentify && (
+        <button onClick={onReidentify} className="w-full mb-4 h-11 rounded-2xl bg-white/80 backdrop-blur-xl border border-black/5 hover:border-black/10 flex items-center justify-center gap-2 text-[13px] font-medium transition-all active:scale-[0.99]" style={{ color: '#5c1a1b' }}>
+          <Search className="w-4 h-4" strokeWidth={2} />
+          זה לא היין הנכון? בחר אחר
+        </button>
+      )}
 
       <div className="mb-4 p-4 bg-white/80 backdrop-blur-xl rounded-2xl border border-black/5 flex items-center justify-between">
         <div>
@@ -1487,4 +1628,237 @@ function TableImport({ onImport, isAnalyzing, status }) {
   }
 
   return null;
+}
+
+// Shared component: live wine search that returns detailed suggestions from Claude
+function WineSearchResults({ query, callClaude, onSelect, autoSearch, initialResults }) {
+  const [results, setResults] = useState(initialResults || []);
+  const [searching, setSearching] = useState(false);
+  const debounceRef = useRef(null);
+  const lastQueryRef = useRef('');
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    const q = (query || '').trim();
+    if (q.length < 3) {
+      setResults([]);
+      setSearching(false);
+      return;
+    }
+    const delay = autoSearch ? 100 : 600;
+    debounceRef.current = setTimeout(async () => {
+      lastQueryRef.current = q;
+      setSearching(true);
+      try {
+        const prompt = `You are a wine search engine like Wine-Searcher. The user is searching: "${q}"
+
+Find up to 8 wines that best match this search. Use your knowledge of wine producers, appellations, and wine names worldwide. Match partial names and common misspellings.
+
+For each result, include all details you know. If multiple vintages exist, list recent/notable vintages as separate results.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{"results":[{"name":"Full wine name","producer":"Producer/winery","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation if any","avgPrice":"estimated retail price range in USD","description":"brief 1-sentence description in Hebrew"}]}
+
+type must be: red, white, rose, sparkling, dessert, or fortified.
+If you're not sure about the vintage, omit that field.
+Return results ordered by relevance and renown.`;
+        const result = await callClaude([{ role: 'user', content: prompt }], 1500);
+        if (lastQueryRef.current !== q) return;
+        let cleaned = result.replace(/```json\n?|```/g, '').trim();
+        const firstBrace = cleaned.indexOf('{');
+        const lastBrace = cleaned.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+        const parsed = JSON.parse(cleaned);
+        setResults(parsed.results || []);
+      } catch (e) {
+        console.error('Search error', e);
+        setResults([]);
+      }
+      setSearching(false);
+    }, delay);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [query, autoSearch, callClaude]);
+
+  const getTypeColor = (t) => {
+    const map = { red: '#8b2635', white: '#b89d4f', rose: '#d47979', 'rosé': '#d47979', sparkling: '#d4bc6a', dessert: '#a06830', fortified: '#7a4a20' };
+    return map[t?.toLowerCase()] || '#8b2635';
+  };
+
+  if (searching && results.length === 0) {
+    return (
+      <div className="py-6 flex items-center justify-center gap-2 text-[13px] text-gray-500">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        מחפש...
+      </div>
+    );
+  }
+
+  if (!searching && results.length === 0 && (query || '').trim().length >= 3) {
+    return (
+      <div className="p-4 text-center text-[13px] text-gray-500">
+        לא נמצאו תוצאות
+      </div>
+    );
+  }
+
+  if (results.length === 0) return null;
+
+  return (
+    <div className="space-y-1.5 max-h-[320px] overflow-y-auto -mx-1 px-1">
+      {results.map((s, i) => (
+        <button
+          key={i}
+          onClick={() => onSelect(s)}
+          className="w-full text-right p-3 rounded-xl bg-gray-50 hover:bg-gray-100 active:scale-[0.99] transition-all flex items-start gap-3"
+        >
+          <div className="w-9 h-12 rounded-md shrink-0 flex items-center justify-center" style={{
+            background: `linear-gradient(180deg, ${getTypeColor(s.type)}, rgba(0,0,0,0.6))`
+          }}>
+            <Wine className="w-4 h-4 text-white/80" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="font-semibold text-[14px] leading-tight mb-0.5" style={{ color: '#1d1d1f' }}>
+              {s.name}
+              {s.vintage && <span className="text-gray-500 font-normal"> · {s.vintage}</span>}
+            </div>
+            <div className="text-[12px] text-gray-500 line-clamp-1">
+              {[s.producer, s.region].filter(Boolean).join(' · ')}
+            </div>
+            {(s.grape || s.avgPrice) && (
+              <div className="text-[11px] text-gray-400 mt-0.5 flex items-center gap-2">
+                {s.grape && <span>{s.grape}</span>}
+                {s.grape && s.avgPrice && <span>·</span>}
+                {s.avgPrice && <span>{s.avgPrice}</span>}
+              </div>
+            )}
+          </div>
+          <span className="text-gray-300 text-lg shrink-0">‹</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Modal shown when a bottle image couldn't be identified - helps user search with the photo visible
+function UnrecognizedHelper({ image, onConfirm, onCancel, callClaude }) {
+  const [query, setQuery] = useState(image?.partialText || '');
+  const [autoSearched, setAutoSearched] = useState(false);
+
+  useEffect(() => {
+    // Auto-search on mount if we have partial text
+    if (image?.partialText && image.partialText.trim().length >= 3) {
+      setAutoSearched(true);
+    }
+  }, [image]);
+
+  const handleSelect = (suggestion) => {
+    onConfirm({
+      name: suggestion.name,
+      producer: suggestion.producer,
+      vintage: suggestion.vintage || null,
+      type: suggestion.type || 'red',
+      grape: suggestion.grape,
+      region: suggestion.region,
+      quantity: 1
+    }, image.dataUrl);
+  };
+
+  return (
+    <div className="space-y-3">
+      {image?.dataUrl && (
+        <div className="relative rounded-xl overflow-hidden bg-gray-100" style={{ maxHeight: '200px' }}>
+          <img src={image.dataUrl} alt="Bottle" className="w-full object-contain" style={{ maxHeight: '200px' }} />
+        </div>
+      )}
+
+      <div className="p-3 rounded-xl bg-amber-50 border border-amber-100">
+        <div className="flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <div className="text-[13px] font-semibold text-amber-900 mb-0.5">לא הצלחתי לזהות את היין בוודאות</div>
+            <div className="text-[12px] text-amber-800 leading-relaxed">
+              {image?.partialText 
+                ? 'הצלחתי לקרוא חלק מהתווית. עזור לי למצוא את היין הנכון בחיפוש למטה.'
+                : 'התווית לא קריאה מספיק. חפש ידנית לפי שם היין או היקב.'}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="relative">
+        <Search className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" strokeWidth={2} />
+        <input
+          type="text"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="הקלד שם יין או יקב..."
+          autoFocus
+          className="w-full h-11 pr-11 pl-4 rounded-2xl bg-gray-50 border border-black/5 text-[15px] outline-none focus:border-black/20 focus:bg-white transition-all"
+        />
+      </div>
+
+      <WineSearchResults query={query} callClaude={callClaude} onSelect={handleSelect} autoSearch={autoSearched} />
+
+      <button
+        onClick={onCancel}
+        className="w-full h-11 rounded-xl bg-gray-100 font-medium text-[14px] transition-all active:scale-[0.98]"
+      >
+        ביטול
+      </button>
+    </div>
+  );
+}
+
+// Modal for "this is not the right wine" flow - helps user pick a replacement
+function ReidentifyHelper({ wine, onReplace, onCancel, callClaude }) {
+  const [query, setQuery] = useState(wine.name || '');
+
+  const handleSelect = (suggestion) => {
+    onReplace({
+      name: suggestion.name,
+      producer: suggestion.producer,
+      vintage: suggestion.vintage || wine.vintage,
+      type: suggestion.type || wine.type || 'red',
+      grape: suggestion.grape,
+      region: suggestion.region,
+      quantity: wine.quantity || 1,
+      price: wine.price,
+      currency: wine.currency
+    });
+  };
+
+  return (
+    <div className="space-y-3">
+      {wine.labelImage && (
+        <div className="relative rounded-xl overflow-hidden bg-gray-100" style={{ maxHeight: '160px' }}>
+          <img src={wine.labelImage} alt="" className="w-full object-contain" style={{ maxHeight: '160px' }} />
+        </div>
+      )}
+
+      <div className="p-3 rounded-xl bg-blue-50 border border-blue-100 text-[12px] text-blue-900 leading-relaxed">
+        חפש את היין הנכון. הכמות והמחיר יישמרו.
+      </div>
+
+      <div className="relative">
+        <Search className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" strokeWidth={2} />
+        <input
+          type="text"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          placeholder="הקלד שם יין או יקב..."
+          autoFocus
+          className="w-full h-11 pr-11 pl-4 rounded-2xl bg-gray-50 border border-black/5 text-[15px] outline-none focus:border-black/20 focus:bg-white transition-all"
+        />
+      </div>
+
+      <WineSearchResults query={query} callClaude={callClaude} onSelect={handleSelect} autoSearch={true} />
+
+      <button
+        onClick={onCancel}
+        className="w-full h-11 rounded-xl bg-gray-100 font-medium text-[14px] transition-all active:scale-[0.98]"
+      >
+        ביטול
+      </button>
+    </div>
+  );
 }
