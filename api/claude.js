@@ -1,9 +1,10 @@
 // Serverless function that proxies requests to Claude API.
+// The API key is read from environment variables (set in Vercel dashboard).
 
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: '4.5mb'
+      sizeLimit: '4.5mb' // Vercel Hobby plan max
     }
   }
 };
@@ -21,7 +22,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { messages, max_tokens = 1500, model = 'claude-sonnet-4-20250514' } = req.body || {};
+    const { messages, max_tokens = 1500, model = 'claude-sonnet-4-5' } = req.body || {};
 
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'messages array is required' });
