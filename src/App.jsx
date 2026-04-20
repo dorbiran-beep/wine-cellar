@@ -109,8 +109,8 @@ export default function App() {
   });
 
   const enrichWine = async (wine) => {
-    try {
-      const prompt = `I need detailed, ACCURATE information about this specific wine:
+    const buildPrompt = (useSearch) => useSearch
+      ? `I need detailed, ACCURATE information about this specific wine:
 Wine: ${wine.name}
 ${wine.producer ? `Producer: ${wine.producer}` : ''}
 ${wine.vintage ? `Vintage: ${wine.vintage}` : ''}
@@ -140,15 +140,49 @@ Based on the real data you find, return ONLY valid JSON (no markdown):
 
 CRITICAL:
 - The type (red/white/rose/etc) MUST match reality. Many natural wines and less-known Italian/French wines are easily misclassified.
-- If search finds the wine is different from what the user said (e.g. you thought white but it's actually red), use the "corrected*" fields.
-- Only include fields where you have actual data from search results. Omit fields where you're uncertain.`;
+- If search finds the wine is different from what the user said, use the "corrected*" fields.
+- Only include fields where you have actual data from search results.`
+      : `You are a wine expert. Based on your knowledge, provide information about this wine:
+Wine: ${wine.name}
+${wine.producer ? `Producer: ${wine.producer}` : ''}
+${wine.vintage ? `Vintage: ${wine.vintage}` : ''}
 
-      const result = await callClaude([{ role: 'user', content: prompt }], 1500, { useWebSearch: true, maxSearches: 3 });
+Return ONLY valid JSON (no markdown):
+{
+  "correctedType": "red/white/rose/sparkling/dessert/fortified if you know it",
+  "correctedGrape": "grape if you know it",
+  "correctedRegion": "region if you know it",
+  "criticScore": 80-100,
+  "criticNotes": "critic notes in Hebrew (2-3 sentences)",
+  "drinkFrom": year,
+  "drinkBy": year,
+  "peakYear": year,
+  "tastingNotes": "tasting notes in Hebrew (3-4 sentences)",
+  "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
+  "servingTemp": "serving temp in Celsius",
+  "decant": true/false
+}
+
+Only include fields you're confident about.`;
+
+    const runEnrich = async (useSearch) => {
+      const result = await callClaude([{ role: 'user', content: buildPrompt(useSearch) }], 1500, useSearch ? { useWebSearch: true, maxSearches: 3 } : {});
       let cleaned = result.replace(/```json\n?|```/g, '').trim();
       const firstBrace = cleaned.indexOf('{');
       const lastBrace = cleaned.lastIndexOf('}');
       if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.substring(firstBrace, lastBrace + 1);
-      const parsed = JSON.parse(cleaned);
+      if (!cleaned) throw new Error('empty response');
+      return JSON.parse(cleaned);
+    };
+
+    try {
+      let parsed;
+      try {
+        parsed = await runEnrich(true);
+      } catch (webErr) {
+        console.warn('Web-search enrichment failed, falling back', webErr);
+        parsed = await runEnrich(false);
+      }
 
       // Apply corrections if the search found better info
       const corrected = {};
@@ -159,7 +193,6 @@ CRITICAL:
       if (parsed.correctedRegion) corrected.region = parsed.correctedRegion;
       if (parsed.correctedVintage) corrected.vintage = parsed.correctedVintage;
 
-      // Remove correction fields from the returned enrichment
       const { correctedName, correctedProducer, correctedType, correctedGrape, correctedRegion, correctedVintage, ...enrichment } = parsed;
       return { ...corrected, ...enrichment };
     } catch (e) {
@@ -846,29 +879,42 @@ function DrinkingWindow({ wine }) {
   const from = wine.drinkFrom || currentYear;
   const to = wine.drinkBy || currentYear + 5;
   const peak = wine.peakYear;
-  const range = to - from || 1;
-  const position = Math.max(0, Math.min(100, ((currentYear - from) / range) * 100));
+  const range = Math.max(1, to - from);
+
+  // Clamp position but remember if we're outside the window
+  const rawPosition = ((currentYear - from) / range) * 100;
+  const position = Math.max(0, Math.min(100, rawPosition));
   const peakPos = peak ? Math.max(0, Math.min(100, ((peak - from) / range) * 100)) : null;
 
+  const isBefore = currentYear < from;
+  const isAfter = currentYear > to;
+  const isOutside = isBefore || isAfter;
+
   return (
-    <div>
+    <div dir="ltr">
+      {/* Year labels: left = from, right = to, forced LTR to keep order correct */}
       <div className="flex items-center justify-between mb-2 text-[12px] font-medium text-gray-500">
         <span>{from}</span>
-        {peak && <span style={{ color: '#d4a574' }}>שיא: {peak}</span>}
+        {peak && <span style={{ color: '#d4a574' }} dir="rtl">שיא: {peak}</span>}
         <span>{to}</span>
       </div>
       <div className="relative h-2 rounded-full bg-gray-100 overflow-hidden">
-        <div className="absolute inset-y-0 right-0 left-0" style={{ background: 'linear-gradient(90deg, #8b9dc3 0%, #7ba87b 30%, #d4a574 70%, #a0a0a0 100%)' }} />
+        <div className="absolute inset-0" style={{ background: 'linear-gradient(90deg, #8b9dc3 0%, #7ba87b 30%, #d4a574 70%, #a0a0a0 100%)' }} />
         {peakPos !== null && (
-          <div className="absolute top-1/2 -translate-y-1/2 w-1 h-4 rounded-full" style={{ right: peakPos + '%', background: '#d4a574', boxShadow: '0 0 0 2px white' }} />
+          <div className="absolute top-1/2 -translate-y-1/2 w-1 h-4 rounded-full" style={{ left: peakPos + '%', background: '#d4a574', boxShadow: '0 0 0 2px white' }} />
         )}
-        <div className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white border-2" style={{
-          right: 'calc(' + position + '% - 6px)',
-          borderColor: '#1d1d1f',
-          boxShadow: '0 2px 4px rgba(0,0,0,0.15)'
+        <div className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full border-2" style={{
+          left: 'calc(' + position + '% - 6px)',
+          background: isOutside ? '#ef4444' : 'white',
+          borderColor: isOutside ? '#b91c1c' : '#1d1d1f',
+          boxShadow: isOutside ? '0 0 0 3px rgba(239, 68, 68, 0.2)' : '0 2px 4px rgba(0,0,0,0.15)'
         }} />
       </div>
-      <div className="text-[12px] text-center mt-2 font-medium" style={{ color: '#1d1d1f' }}>היום · {currentYear}</div>
+      <div className="text-[12px] text-center mt-2 font-medium" dir="rtl" style={{ color: isOutside ? '#b91c1c' : '#1d1d1f' }}>
+        {isBefore && '⚠️ מוקדם מדי · '}
+        {isAfter && '⚠️ עבר את השיא · '}
+        היום · {currentYear}
+      </div>
     </div>
   );
 }
@@ -1111,29 +1157,56 @@ function ManualAddForm({ onSubmit, isLoading, callClaude }) {
     debounceRef.current = setTimeout(async () => {
       lastQueryRef.current = q;
       setSearching(true);
-      try {
-        const prompt = `You are a wine search assistant. The user is searching for: "${q}"
+
+      const doSearch = async (useWebSearch) => {
+        const prompt = useWebSearch
+          ? `You are a wine search assistant. The user is searching for: "${q}"
 
 Search Wine-Searcher.com, Vivino, and similar wine databases to find up to 6 REAL wines matching this query.
 
-Based on actual search results, return ONLY valid JSON (no markdown):
-{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation","avgPrice":"price range in USD","description":"1-sentence description in Hebrew"}]}
+Return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","avgPrice":"$25-40","description":"1-sentence description in Hebrew"}]}
 
 CRITICAL:
 - type must be VERIFIED: red, white, rose, sparkling, dessert, or fortified
-- Do NOT invent wines. Only list real wines found in search.
-- Order by relevance.`;
-        const result = await callClaude([{ role: 'user', content: prompt }], 1800, { useWebSearch: true, maxSearches: 2 });
-        if (lastQueryRef.current !== q) return; // user typed more since
+- Only list real wines found in search
+- Order by relevance`
+          : `You are a wine expert. Suggest up to 6 wines matching: "${q}"
 
+Return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","avgPrice":"$25-40","description":"1-sentence description in Hebrew"}]}
+
+type must be: red, white, rose, sparkling, dessert, or fortified.`;
+
+        const result = await callClaude([{ role: 'user', content: prompt }], 1800, useWebSearch ? { useWebSearch: true, maxSearches: 2 } : {});
         let cleaned = result.replace(/```json\n?|```/g, '').trim();
         const firstBrace = cleaned.indexOf('{');
         const lastBrace = cleaned.lastIndexOf('}');
         if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+        if (!cleaned) throw new Error('empty response');
         const parsed = JSON.parse(cleaned);
-        setSuggestions(parsed.results || []);
+        return parsed.results || [];
+      };
+
+      try {
+        let found = [];
+        try {
+          found = await doSearch(true);
+        } catch (webErr) {
+          console.warn('Web search failed, falling back', webErr);
+        }
+        if (!found.length) {
+          try {
+            found = await doSearch(false);
+          } catch (fallbackErr) {
+            console.error('Fallback failed', fallbackErr);
+          }
+        }
+        if (lastQueryRef.current !== q) return;
+        setSuggestions(found);
       } catch (e) {
         console.error('Search error', e);
+        if (lastQueryRef.current !== q) return;
         setSuggestions([]);
       }
       setSearching(false);
@@ -1685,6 +1758,7 @@ function TableImport({ onImport, isAnalyzing, status }) {
 function WineSearchResults({ query, callClaude, onSelect, autoSearch, initialResults }) {
   const [results, setResults] = useState(initialResults || []);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState('');
   const debounceRef = useRef(null);
   const lastQueryRef = useRef('');
 
@@ -1694,36 +1768,74 @@ function WineSearchResults({ query, callClaude, onSelect, autoSearch, initialRes
     if (q.length < 3) {
       setResults([]);
       setSearching(false);
+      setSearchError('');
       return;
     }
     const delay = autoSearch ? 100 : 600;
     debounceRef.current = setTimeout(async () => {
       lastQueryRef.current = q;
       setSearching(true);
-      try {
-        const prompt = `You are a wine search assistant. The user is searching for: "${q}"
+      setSearchError('');
 
-Search Wine-Searcher.com, Vivino, Decanter, and similar wine databases to find up to 8 REAL wines that match this search. Include both exact matches and related wines from the same producer/region.
+      const doSearch = async (useWebSearch) => {
+        const prompt = useWebSearch
+          ? `You are a wine search assistant. The user is searching for: "${q}"
 
-Based on actual search results, return ONLY valid JSON (no markdown):
-{"results":[{"name":"Full wine name","producer":"Producer/winery","vintage":2019,"type":"red","grape":"Actual grape variety","region":"Region, Country","appellation":"Appellation","avgPrice":"price range in USD like $25-40","description":"1-sentence description in Hebrew based on real info"}]}
+Search Wine-Searcher.com, Vivino, Decanter, and similar wine databases to find up to 8 REAL wines matching this search.
+
+Return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation","avgPrice":"$25-40","description":"1-sentence description in Hebrew"}]}
 
 CRITICAL:
 - type must be VERIFIED: red, white, rose, sparkling, dessert, or fortified
-- Do NOT invent wines. Only list real wines confirmed by search.
-- If the search returns fewer than 8 matches, return fewer. Don't pad with guesses.
-- Order by relevance and renown of the producer.`;
-        const result = await callClaude([{ role: 'user', content: prompt }], 1800, { useWebSearch: true, maxSearches: 2 });
-        if (lastQueryRef.current !== q) return;
+- Only list real wines confirmed by search
+- Order by relevance`
+          : `You are a wine expert. A user is searching for: "${q}"
+
+Based on your knowledge of wines worldwide (producers, appellations, famous and niche wines), suggest up to 8 wines that best match this query. Match partial names and common misspellings.
+
+Return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","avgPrice":"$25-40","description":"1-sentence description in Hebrew"}]}
+
+type must be: red, white, rose, sparkling, dessert, or fortified.
+Order by relevance and renown.`;
+
+        const result = await callClaude([{ role: 'user', content: prompt }], 1800, useWebSearch ? { useWebSearch: true, maxSearches: 2 } : {});
         let cleaned = result.replace(/```json\n?|```/g, '').trim();
         const firstBrace = cleaned.indexOf('{');
         const lastBrace = cleaned.lastIndexOf('}');
         if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+        if (!cleaned) throw new Error('empty response');
         const parsed = JSON.parse(cleaned);
-        setResults(parsed.results || []);
+        return parsed.results || [];
+      };
+
+      try {
+        // Try web search first
+        let found = [];
+        try {
+          found = await doSearch(true);
+        } catch (webErr) {
+          console.warn('Web search failed, falling back to knowledge-based search', webErr);
+        }
+
+        // If web search returned nothing, try knowledge-based as fallback
+        if (!found.length) {
+          try {
+            found = await doSearch(false);
+          } catch (fallbackErr) {
+            console.error('Fallback search also failed', fallbackErr);
+          }
+        }
+
+        if (lastQueryRef.current !== q) return;
+        setResults(found);
+        if (!found.length) setSearchError('חיפוש הושלם אך לא נמצאו יינות. נסה מונחי חיפוש שונים.');
       } catch (e) {
         console.error('Search error', e);
+        if (lastQueryRef.current !== q) return;
         setResults([]);
+        setSearchError('שגיאה בחיפוש: ' + (e.message || '').substring(0, 100));
       }
       setSearching(false);
     }, delay);
@@ -1739,7 +1851,7 @@ CRITICAL:
     return (
       <div className="py-6 flex items-center justify-center gap-2 text-[13px] text-gray-500">
         <Loader2 className="w-4 h-4 animate-spin" />
-        מחפש...
+        מחפש ברחבי האינטרנט...
       </div>
     );
   }
@@ -1747,7 +1859,7 @@ CRITICAL:
   if (!searching && results.length === 0 && (query || '').trim().length >= 3) {
     return (
       <div className="p-4 text-center text-[13px] text-gray-500">
-        לא נמצאו תוצאות
+        {searchError || 'לא נמצאו תוצאות'}
       </div>
     );
   }
