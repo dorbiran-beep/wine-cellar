@@ -33,12 +33,17 @@ export default function App() {
 
   const [debugInfo, setDebugInfo] = useState(null);
 
-  const callClaude = async (messages, maxTokens = 1500) => {
+  const callClaude = async (messages, maxTokens = 1500, options = {}) => {
     try {
       const response = await fetch('/api/claude', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages, max_tokens: maxTokens })
+        body: JSON.stringify({
+          messages,
+          max_tokens: maxTokens,
+          useWebSearch: options.useWebSearch || false,
+          maxSearches: options.maxSearches || 3
+        })
       });
       if (!response.ok) {
         const errText = await response.text();
@@ -51,6 +56,7 @@ export default function App() {
       if (!data.content) {
         throw new Error(`No content in response`);
       }
+      // Extract text from all content blocks (ignore tool_use / web_search_tool_result blocks)
       return data.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
     } catch (e) {
       throw new Error('שגיאת רשת: ' + e.message);
@@ -104,14 +110,60 @@ export default function App() {
 
   const enrichWine = async (wine) => {
     try {
-      const prompt = 'עבור היין: ' + wine.name + ' ' + (wine.vintage || '') + ' מאת ' + (wine.producer || 'לא ידוע') +
-        (wine.region ? ' אזור: ' + wine.region : '') +
-        (wine.grape ? ' זן: ' + wine.grape : '') +
-        '\n\nהחזר JSON בלבד: {"criticScore": ציון 80-100, "criticNotes": "הערות בעברית", "drinkFrom": שנה, "drinkBy": שנה, "peakYear": שנה, "tastingNotes": "תווי טעימה בעברית", "foodPairings": ["מנה1","מנה2","מנה3","מנה4"], "servingTemp": "טמפ הגשה", "decant": true/false}';
-      const result = await callClaude([{ role: 'user', content: prompt }], 800);
-      const cleaned = result.replace(/```json\n?|```/g, '').trim();
-      return JSON.parse(cleaned);
+      const prompt = `I need detailed, ACCURATE information about this specific wine:
+Wine: ${wine.name}
+${wine.producer ? `Producer: ${wine.producer}` : ''}
+${wine.vintage ? `Vintage: ${wine.vintage}` : ''}
+${wine.region ? `Region: ${wine.region}` : ''}
+${wine.grape ? `Grape: ${wine.grape}` : ''}
+
+Search Wine-Searcher.com, Vivino, Decanter, Wine Enthusiast, and similar reputable wine sites to find REAL, FACTUAL information about this specific wine. Do NOT guess or invent details.
+
+Based on the real data you find, return ONLY valid JSON (no markdown):
+{
+  "correctedName": "authoritative full wine name if yours differs",
+  "correctedProducer": "correct producer name",
+  "correctedType": "red/white/rose/sparkling/dessert/fortified - VERIFY this from the search",
+  "correctedGrape": "actual grape variety",
+  "correctedRegion": "actual region and country",
+  "correctedVintage": vintage as number if clearer from search,
+  "criticScore": numeric score 80-100 based on actual Wine-Searcher aggregate or critic scores found,
+  "criticNotes": "brief critic notes in Hebrew based on real reviews found (2-3 sentences, no fabrication)",
+  "drinkFrom": year,
+  "drinkBy": year,
+  "peakYear": year,
+  "tastingNotes": "real tasting notes in Hebrew based on search results (3-4 sentences)",
+  "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
+  "servingTemp": "serving temp in Celsius",
+  "decant": true/false
+}
+
+CRITICAL:
+- The type (red/white/rose/etc) MUST match reality. Many natural wines and less-known Italian/French wines are easily misclassified.
+- If search finds the wine is different from what the user said (e.g. you thought white but it's actually red), use the "corrected*" fields.
+- Only include fields where you have actual data from search results. Omit fields where you're uncertain.`;
+
+      const result = await callClaude([{ role: 'user', content: prompt }], 1500, { useWebSearch: true, maxSearches: 3 });
+      let cleaned = result.replace(/```json\n?|```/g, '').trim();
+      const firstBrace = cleaned.indexOf('{');
+      const lastBrace = cleaned.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace !== -1) cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+      const parsed = JSON.parse(cleaned);
+
+      // Apply corrections if the search found better info
+      const corrected = {};
+      if (parsed.correctedName) corrected.name = parsed.correctedName;
+      if (parsed.correctedProducer) corrected.producer = parsed.correctedProducer;
+      if (parsed.correctedType) corrected.type = parsed.correctedType;
+      if (parsed.correctedGrape) corrected.grape = parsed.correctedGrape;
+      if (parsed.correctedRegion) corrected.region = parsed.correctedRegion;
+      if (parsed.correctedVintage) corrected.vintage = parsed.correctedVintage;
+
+      // Remove correction fields from the returned enrichment
+      const { correctedName, correctedProducer, correctedType, correctedGrape, correctedRegion, correctedVintage, ...enrichment } = parsed;
+      return { ...corrected, ...enrichment };
     } catch (e) {
+      console.warn('Enrichment error:', e);
       return {};
     }
   };
@@ -1060,19 +1112,18 @@ function ManualAddForm({ onSubmit, isLoading, callClaude }) {
       lastQueryRef.current = q;
       setSearching(true);
       try {
-        const prompt = `You are a wine search engine like Wine-Searcher. The user is searching: "${q}"
+        const prompt = `You are a wine search assistant. The user is searching for: "${q}"
 
-Find up to 6 wines that best match this search. Use your knowledge of wine producers, appellations, and wine names worldwide. Match even partial names (e.g., "barolo canub" -> Barolo Cannubi by various producers).
+Search Wine-Searcher.com, Vivino, and similar wine databases to find up to 6 REAL wines matching this query.
 
-For each result, include all details you know. If multiple vintages exist, list recent/notable vintages as separate results.
+Based on actual search results, return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation","avgPrice":"price range in USD","description":"1-sentence description in Hebrew"}]}
 
-Return ONLY valid JSON (no markdown, no explanation):
-{"results":[{"name":"Full wine name","producer":"Producer/winery","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation if any","avgPrice":"estimated retail price range in USD","description":"brief 1-sentence description in Hebrew"}]}
-
-type must be: red, white, rose, sparkling, dessert, or fortified.
-If you're not sure about the vintage, omit that field.
-Return results ordered by relevance and renown.`;
-        const result = await callClaude([{ role: 'user', content: prompt }], 1500);
+CRITICAL:
+- type must be VERIFIED: red, white, rose, sparkling, dessert, or fortified
+- Do NOT invent wines. Only list real wines found in search.
+- Order by relevance.`;
+        const result = await callClaude([{ role: 'user', content: prompt }], 1800, { useWebSearch: true, maxSearches: 2 });
         if (lastQueryRef.current !== q) return; // user typed more since
 
         let cleaned = result.replace(/```json\n?|```/g, '').trim();
@@ -1650,19 +1701,19 @@ function WineSearchResults({ query, callClaude, onSelect, autoSearch, initialRes
       lastQueryRef.current = q;
       setSearching(true);
       try {
-        const prompt = `You are a wine search engine like Wine-Searcher. The user is searching: "${q}"
+        const prompt = `You are a wine search assistant. The user is searching for: "${q}"
 
-Find up to 8 wines that best match this search. Use your knowledge of wine producers, appellations, and wine names worldwide. Match partial names and common misspellings.
+Search Wine-Searcher.com, Vivino, Decanter, and similar wine databases to find up to 8 REAL wines that match this search. Include both exact matches and related wines from the same producer/region.
 
-For each result, include all details you know. If multiple vintages exist, list recent/notable vintages as separate results.
+Based on actual search results, return ONLY valid JSON (no markdown):
+{"results":[{"name":"Full wine name","producer":"Producer/winery","vintage":2019,"type":"red","grape":"Actual grape variety","region":"Region, Country","appellation":"Appellation","avgPrice":"price range in USD like $25-40","description":"1-sentence description in Hebrew based on real info"}]}
 
-Return ONLY valid JSON (no markdown, no explanation):
-{"results":[{"name":"Full wine name","producer":"Producer/winery","vintage":2019,"type":"red","grape":"Grape variety","region":"Region, Country","appellation":"Appellation if any","avgPrice":"estimated retail price range in USD","description":"brief 1-sentence description in Hebrew"}]}
-
-type must be: red, white, rose, sparkling, dessert, or fortified.
-If you're not sure about the vintage, omit that field.
-Return results ordered by relevance and renown.`;
-        const result = await callClaude([{ role: 'user', content: prompt }], 1500);
+CRITICAL:
+- type must be VERIFIED: red, white, rose, sparkling, dessert, or fortified
+- Do NOT invent wines. Only list real wines confirmed by search.
+- If the search returns fewer than 8 matches, return fewer. Don't pad with guesses.
+- Order by relevance and renown of the producer.`;
+        const result = await callClaude([{ role: 'user', content: prompt }], 1800, { useWebSearch: true, maxSearches: 2 });
         if (lastQueryRef.current !== q) return;
         let cleaned = result.replace(/```json\n?|```/g, '').trim();
         const firstBrace = cleaned.indexOf('{');
