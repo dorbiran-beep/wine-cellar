@@ -15,6 +15,7 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [unrecognizedImage, setUnrecognizedImage] = useState(null);
   const [wineToReidentify, setWineToReidentify] = useState(null);
+  const [wineToReenrich, setWineToReenrich] = useState(null);
 
   useEffect(() => {
     try {
@@ -108,44 +109,50 @@ export default function App() {
     reader.readAsDataURL(file);
   });
 
-  const enrichWine = async (wine) => {
+  const enrichWine = async (wine, hints) => {
+    const hintsText = hints && hints.trim() ? `\n\nADDITIONAL HINTS from the user (use these to refine the search):\n${hints.trim()}\n` : '';
+
     const buildPrompt = (useSearch) => useSearch
       ? `I need detailed, ACCURATE information about this specific wine:
 Wine: ${wine.name}
 ${wine.producer ? `Producer: ${wine.producer}` : ''}
 ${wine.vintage ? `Vintage: ${wine.vintage}` : ''}
 ${wine.region ? `Region: ${wine.region}` : ''}
-${wine.grape ? `Grape: ${wine.grape}` : ''}
+${wine.grape ? `Grape: ${wine.grape}` : ''}${hintsText}
 
-Search Wine-Searcher.com, Vivino, Decanter, Wine Enthusiast, and similar reputable wine sites to find REAL, FACTUAL information about this specific wine. Do NOT guess or invent details.
+Search Wine-Searcher.com, CellarTracker, Vivino, Decanter, Wine Enthusiast, Vinous, James Suckling and similar reputable wine sites to find REAL, FACTUAL information. Do NOT guess or invent details.
+
+For boutique/natural/lesser-known wines, also try searching for the producer's website directly, or for the specific cuvée name. Search in multiple ways if needed.
 
 Based on the real data you find, return ONLY valid JSON (no markdown):
 {
   "correctedName": "authoritative full wine name if yours differs",
   "correctedProducer": "correct producer name",
   "correctedType": "red/white/rose/sparkling/dessert/fortified - VERIFY this from the search",
-  "correctedGrape": "actual grape variety",
+  "correctedGrape": "actual grape variety/varieties",
   "correctedRegion": "actual region and country",
   "correctedVintage": vintage as number if clearer from search,
-  "criticScore": numeric score 80-100 based on actual Wine-Searcher aggregate or critic scores found,
-  "criticNotes": "brief critic notes in Hebrew based on real reviews found (2-3 sentences, no fabrication)",
+  "criticScore": numeric score 80-100 based on actual aggregate or critic scores found,
+  "criticNotes": "brief critic notes in Hebrew based on real reviews found (2-3 sentences)",
   "drinkFrom": year,
   "drinkBy": year,
   "peakYear": year,
   "tastingNotes": "real tasting notes in Hebrew based on search results (3-4 sentences)",
   "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
   "servingTemp": "serving temp in Celsius",
-  "decant": true/false
+  "decant": true/false,
+  "_searchSucceeded": true if you found real data, false if you couldn't find this specific wine
 }
 
 CRITICAL:
-- The type (red/white/rose/etc) MUST match reality. Many natural wines and less-known Italian/French wines are easily misclassified.
-- If search finds the wine is different from what the user said, use the "corrected*" fields.
-- Only include fields where you have actual data from search results.`
+- The type (red/white/rose/etc) MUST match reality. Many natural and lesser-known wines are easily misclassified.
+- If search finds the wine is different from what user said, use the "corrected*" fields.
+- Set "_searchSucceeded" to false if you couldn't find real info about this specific wine.
+- Only include fields where you have actual data. Omit fields where you're uncertain.`
       : `You are a wine expert. Based on your knowledge, provide information about this wine:
 Wine: ${wine.name}
 ${wine.producer ? `Producer: ${wine.producer}` : ''}
-${wine.vintage ? `Vintage: ${wine.vintage}` : ''}
+${wine.vintage ? `Vintage: ${wine.vintage}` : ''}${hintsText}
 
 Return ONLY valid JSON (no markdown):
 {
@@ -160,13 +167,14 @@ Return ONLY valid JSON (no markdown):
   "tastingNotes": "tasting notes in Hebrew (3-4 sentences)",
   "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
   "servingTemp": "serving temp in Celsius",
-  "decant": true/false
+  "decant": true/false,
+  "_searchSucceeded": false
 }
 
 Only include fields you're confident about.`;
 
     const runEnrich = async (useSearch) => {
-      const result = await callClaude([{ role: 'user', content: buildPrompt(useSearch) }], 1500, useSearch ? { useWebSearch: true, maxSearches: 3 } : {});
+      const result = await callClaude([{ role: 'user', content: buildPrompt(useSearch) }], 1500, useSearch ? { useWebSearch: true, maxSearches: hints ? 4 : 3 } : {});
       let cleaned = result.replace(/```json\n?|```/g, '').trim();
       const firstBrace = cleaned.indexOf('{');
       const lastBrace = cleaned.lastIndexOf('}');
@@ -197,8 +205,22 @@ Only include fields you're confident about.`;
       return { ...corrected, ...enrichment };
     } catch (e) {
       console.warn('Enrichment error:', e);
-      return {};
+      return { _searchSucceeded: false };
     }
+  };
+
+  // Re-enrich an existing wine with optional user hints (e.g. "this is a natural orange wine, Sangiovese grape")
+  const reenrichWineWithHints = async (wineId, hints) => {
+    const wine = wines.find(w => w.id === wineId);
+    if (!wine) return;
+    setWineToReenrich(null);
+    setWines(prev => prev.map(w => w.id === wineId ? { ...w, _enriching: true } : w));
+    if (selectedWine?.id === wineId) setSelectedWine(p => ({ ...p, _enriching: true }));
+
+    const extra = await enrichWine(wine, hints);
+    const updated = { ...wine, ...extra, _enriching: false };
+    setWines(prev => prev.map(w => w.id === wineId ? updated : w));
+    if (selectedWine?.id === wineId) setSelectedWine(updated);
   };
 
   const analyzeWineImage = async (files, mode) => {
@@ -518,7 +540,7 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
 
       <main className="max-w-6xl mx-auto px-5 py-6 relative">
         {selectedWine ? (
-          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} onReidentify={() => setWineToReidentify(selectedWine)} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
+          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} onReidentify={() => setWineToReidentify(selectedWine)} onReenrich={() => setWineToReenrich(selectedWine)} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
         ) : view === 'cellar' ? (
           <CellarView wines={filteredWines} allWines={wines} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} sortBy={sortBy} setSortBy={setSortBy} onSelectWine={setSelectedWine} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} onOpenAdd={() => setShowAddMenu(true)} />
         ) : view === 'recommendations' ? (
@@ -575,6 +597,16 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
             onReplace={(newData) => replaceWine(wineToReidentify.id, newData)}
             onCancel={() => setWineToReidentify(null)}
             callClaude={callClaude}
+          />
+        </Modal>
+      )}
+
+      {wineToReenrich && (
+        <Modal onClose={() => setWineToReenrich(null)} title="חיפוש מידע נוסף">
+          <ReenrichHelper
+            wine={wineToReenrich}
+            onReenrich={(hints) => reenrichWineWithHints(wineToReenrich.id, hints)}
+            onCancel={() => setWineToReenrich(null)}
           />
         </Modal>
       )}
@@ -708,7 +740,7 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
   );
 }
 
-function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, getDrinkStatus, getWineColor, translateType }) {
+function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, onReenrich, getDrinkStatus, getWineColor, translateType }) {
   const status = getDrinkStatus(wine);
   const colors = getWineColor(wine.type);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -791,12 +823,22 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, ge
         </div>
       )}
 
-      {/* Reidentify button - only for wines with a label image */}
-      {wine.labelImage && onReidentify && (
-        <button onClick={onReidentify} className="w-full mb-4 h-11 rounded-2xl bg-white/80 backdrop-blur-xl border border-black/5 hover:border-black/10 flex items-center justify-center gap-2 text-[13px] font-medium transition-all active:scale-[0.99]" style={{ color: '#5c1a1b' }}>
-          <Search className="w-4 h-4" strokeWidth={2} />
-          זה לא היין הנכון? בחר אחר
-        </button>
+      {/* Action buttons */}
+      {(wine.labelImage || onReenrich) && (
+        <div className="grid grid-cols-1 gap-2 mb-4">
+          {wine.labelImage && onReidentify && (
+            <button onClick={onReidentify} className="h-11 rounded-2xl bg-white/80 backdrop-blur-xl border border-black/5 hover:border-black/10 flex items-center justify-center gap-2 text-[13px] font-medium transition-all active:scale-[0.99]" style={{ color: '#5c1a1b' }}>
+              <Search className="w-4 h-4" strokeWidth={2} />
+              זה לא היין הנכון? בחר אחר
+            </button>
+          )}
+          {onReenrich && (
+            <button onClick={onReenrich} disabled={wine._enriching} className="h-11 rounded-2xl bg-white/80 backdrop-blur-xl border border-black/5 hover:border-black/10 flex items-center justify-center gap-2 text-[13px] font-medium transition-all active:scale-[0.99] disabled:opacity-50" style={{ color: '#5c1a1b' }}>
+              {wine._enriching ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" strokeWidth={2} />}
+              {wine._enriching ? 'מעשיר...' : 'חפש מידע נוסף / נכון יותר'}
+            </button>
+          )}
+        </div>
       )}
 
       <div className="mb-4 p-4 bg-white/80 backdrop-blur-xl rounded-2xl border border-black/5 flex items-center justify-between">
@@ -2022,6 +2064,78 @@ function ReidentifyHelper({ wine, onReplace, onCancel, callClaude }) {
       >
         ביטול
       </button>
+    </div>
+  );
+}
+
+// Modal for "find more info" — lets user provide hints to refine the enrichment search
+function ReenrichHelper({ wine, onReenrich, onCancel }) {
+  const [hints, setHints] = useState('');
+
+  const presets = [
+    { label: '🔴 זה יין אדום', value: 'This is a RED wine.' },
+    { label: '⚪️ זה יין לבן', value: 'This is a WHITE wine.' },
+    { label: '🟠 זה יין כתום/טבעי', value: 'This is an ORANGE / natural wine, made with extended skin contact.' },
+    { label: '🌸 זה יין רוזה', value: 'This is a ROSE wine.' },
+    { label: '🫧 זה יין מבעבע', value: 'This is a SPARKLING wine.' },
+  ];
+
+  const togglePreset = (value) => {
+    if (hints.includes(value)) {
+      setHints(hints.replace(value, '').replace(/\n+/g, '\n').trim());
+    } else {
+      setHints((hints + '\n' + value).trim());
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="p-3 rounded-xl bg-blue-50 border border-blue-100 text-[12px] text-blue-900 leading-relaxed">
+        אם המידע על היין לא מדויק או חסר, תוכל להוסיף רמזים שיעזרו לחיפוש להיות מדויק יותר. אפשר גם להשאיר ריק וסתם לנסות שוב.
+      </div>
+
+      <div className="p-3 rounded-xl bg-gray-50 border border-black/5">
+        <div className="text-[11px] text-gray-500 uppercase tracking-wider font-semibold mb-1">היין הנוכחי</div>
+        <div className="text-[14px] font-semibold" style={{ color: '#1d1d1f' }}>{wine.name}</div>
+        <div className="text-[12px] text-gray-500">{[wine.producer, wine.vintage, wine.region].filter(Boolean).join(' · ')}</div>
+      </div>
+
+      <div>
+        <label className="text-[11px] font-medium text-gray-500 uppercase tracking-wide block mb-2">סוג מהיר</label>
+        <div className="flex flex-wrap gap-1.5">
+          {presets.map(p => {
+            const active = hints.includes(p.value);
+            return (
+              <button
+                key={p.label}
+                onClick={() => togglePreset(p.value)}
+                className={"px-3 py-1.5 rounded-full text-[12px] font-medium transition-all " + (active ? 'text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200')}
+                style={active ? { background: '#5c1a1b' } : {}}
+              >
+                {p.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div>
+        <label className="text-[11px] font-medium text-gray-500 uppercase tracking-wide">רמזים נוספים (אופציונלי)</label>
+        <textarea
+          value={hints}
+          onChange={e => setHints(e.target.value)}
+          placeholder="למשל: זן Sangiovese, מאזור Romagna, יין טבעי, או שם מלא יותר של הקובי..."
+          rows={4}
+          className="w-full mt-1 p-3 rounded-xl bg-gray-50 border border-black/5 outline-none focus:border-black/20 text-[14px]"
+        />
+      </div>
+
+      <div className="flex gap-2">
+        <button onClick={onCancel} className="flex-1 h-11 rounded-xl bg-gray-100 font-medium text-[14px]">ביטול</button>
+        <button onClick={() => onReenrich(hints)} className="flex-[2] h-11 rounded-xl text-white font-semibold text-[14px]" style={{ background: 'linear-gradient(135deg, #5c1a1b, #3a1011)', boxShadow: '0 4px 16px rgba(92, 26, 27, 0.3)' }}>
+          חפש עכשיו
+        </button>
+      </div>
     </div>
   );
 }
