@@ -48,6 +48,8 @@ export default async function handler(req, res) {
           'www.wine-searcher.com',
           'vivino.com',
           'www.vivino.com',
+          'cellartracker.com',
+          'www.cellartracker.com',
           'winemag.com',
           'www.winemag.com',
           'decanter.com',
@@ -59,7 +61,19 @@ export default async function handler(req, res) {
           'klwines.com',
           'www.klwines.com',
           'jamessuckling.com',
-          'www.jamessuckling.com'
+          'www.jamessuckling.com',
+          'robertparker.com',
+          'www.robertparker.com',
+          'winefolly.com',
+          'www.winefolly.com',
+          'wineanorak.com',
+          'www.wineanorak.com',
+          'vinous.com',
+          'www.vinous.com',
+          'wine-pages.com',
+          'www.wine-pages.com',
+          'tim-atkin.com',
+          'www.tim-atkin.com'
         ]
       }];
     }
