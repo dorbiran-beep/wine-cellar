@@ -16,6 +16,7 @@ export default function App() {
   const [unrecognizedImage, setUnrecognizedImage] = useState(null);
   const [wineToReidentify, setWineToReidentify] = useState(null);
   const [wineToReenrich, setWineToReenrich] = useState(null);
+  const [mergeToast, setMergeToast] = useState(null); // { mergedNames: [...], onUndo: fn }
 
   useEffect(() => {
     try {
@@ -109,6 +110,97 @@ export default function App() {
     reader.readAsDataURL(file);
   });
 
+  // ───── Duplicate detection & merging ─────
+  // Normalize a string for comparison: lowercase, collapse whitespace, strip punctuation
+  const normalize = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\u0590-\u05FF]+/g, ' ').trim();
+
+  // Find an existing wine in the cellar that matches a candidate (same name+producer+vintage)
+  const findDuplicate = (candidate, existingWines) => {
+    if (!candidate.name) return null;
+    const candName = normalize(candidate.name);
+    const candProducer = normalize(candidate.producer);
+    const candVintage = candidate.vintage ? parseInt(candidate.vintage) : null;
+    return existingWines.find(w => {
+      const wName = normalize(w.name);
+      const wProducer = normalize(w.producer);
+      const wVintage = w.vintage ? parseInt(w.vintage) : null;
+      // Vintage must match (both null OR equal)
+      if (candVintage !== wVintage) return false;
+      // Name must match closely - exact match or one contains the other
+      const namesMatch = wName === candName || (wName.length > 8 && candName.length > 8 && (wName.includes(candName) || candName.includes(wName)));
+      if (!namesMatch) return false;
+      // If both have producers, they should match too
+      if (candProducer && wProducer && candProducer !== wProducer && !candProducer.includes(wProducer) && !wProducer.includes(candProducer)) return false;
+      return true;
+    });
+  };
+
+  // Add a wine, but merge with an existing one if it's a duplicate.
+  // Returns { wine, wasMerged }
+  const addOrMergeWine = (newWine, existingWines) => {
+    const dup = findDuplicate(newWine, existingWines);
+    if (!dup) {
+      return { wine: newWine, wasMerged: false, mergedInto: null };
+    }
+    // Merge: add quantity, keep richer data, prefer existing label image unless new one is provided and old one isn't
+    const addedQty = newWine.quantity || 1;
+    const merged = {
+      ...dup,
+      quantity: (dup.quantity || 1) + addedQty,
+      // Keep the label image - prefer existing, but use new if missing
+      labelImage: dup.labelImage || newWine.labelImage,
+      // Prefer new enrichment fields if they exist and old ones don't
+      criticScore: dup.criticScore || newWine.criticScore,
+      criticNotes: dup.criticNotes || newWine.criticNotes,
+      drinkFrom: dup.drinkFrom || newWine.drinkFrom,
+      drinkBy: dup.drinkBy || newWine.drinkBy,
+      peakYear: dup.peakYear || newWine.peakYear,
+      tastingNotes: dup.tastingNotes || newWine.tastingNotes,
+      foodPairings: dup.foodPairings && dup.foodPairings.length ? dup.foodPairings : newWine.foodPairings,
+      servingTemp: dup.servingTemp || newWine.servingTemp,
+      decant: dup.decant !== undefined ? dup.decant : newWine.decant,
+      grape: dup.grape || newWine.grape,
+      region: dup.region || newWine.region,
+      // Track purchase history for price differences
+      purchaseHistory: [
+        ...(dup.purchaseHistory || (dup.price ? [{ price: dup.price, currency: dup.currency, quantity: dup.quantity || 1, date: dup.addedAt }] : [])),
+        { price: newWine.price, currency: newWine.currency, quantity: addedQty, date: new Date().toISOString() }
+      ].filter(h => h.price)
+    };
+    return { wine: merged, wasMerged: true, mergedInto: dup };
+  };
+
+  // Process a batch of new wines, merging duplicates into existing ones.
+  // Returns the updated full wines list, AND info about what was merged.
+  const mergeWinesIntoCellar = (newWines, existingWines) => {
+    const finalWines = [...existingWines];
+    const merged = []; // { newName, intoName, addedQty }
+    const trulyNew = [];
+
+    for (const nw of newWines) {
+      const dup = findDuplicate(nw, finalWines);
+      if (dup) {
+        const result = addOrMergeWine(nw, finalWines);
+        const idx = finalWines.findIndex(w => w.id === dup.id);
+        finalWines[idx] = result.wine;
+        merged.push({ name: nw.name, vintage: nw.vintage, addedQty: nw.quantity || 1, totalQty: result.wine.quantity });
+      } else {
+        finalWines.unshift(nw); // new at top
+        trulyNew.push(nw);
+      }
+    }
+
+    return { wines: finalWines, merged, trulyNew };
+  };
+
+  // Show merge toast if anything was merged
+  const showMergeToastIfNeeded = (merged) => {
+    if (merged.length > 0) {
+      setMergeToast({ items: merged });
+      setTimeout(() => setMergeToast(null), 5000);
+    }
+  };
+
   const enrichWine = async (wine, hints) => {
     const hintsText = hints && hints.trim() ? `\n\nADDITIONAL HINTS from the user (use these to refine the search):\n${hints.trim()}\n` : '';
 
@@ -141,6 +233,8 @@ Based on the real data you find, return ONLY valid JSON (no markdown):
   "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
   "servingTemp": "serving temp in Celsius",
   "decant": true/false,
+  "marketValue": current average retail price per bottle in USD (number, no currency symbol),
+  "marketValueCurrency": "USD",
   "_searchSucceeded": true if you found real data, false if you couldn't find this specific wine
 }
 
@@ -148,6 +242,7 @@ CRITICAL:
 - The type (red/white/rose/etc) MUST match reality. Many natural and lesser-known wines are easily misclassified.
 - If search finds the wine is different from what user said, use the "corrected*" fields.
 - Set "_searchSucceeded" to false if you couldn't find real info about this specific wine.
+- For marketValue: use the Wine-Searcher aggregate average price for the SPECIFIC vintage if available, otherwise the average across vintages. Number only, in USD.
 - Only include fields where you have actual data. Omit fields where you're uncertain.`
       : `You are a wine expert. Based on your knowledge, provide information about this wine:
 Wine: ${wine.name}
@@ -168,10 +263,11 @@ Return ONLY valid JSON (no markdown):
   "foodPairings": ["dish1 in Hebrew","dish2","dish3","dish4"],
   "servingTemp": "serving temp in Celsius",
   "decant": true/false,
+  "marketValue": null,
   "_searchSucceeded": false
 }
 
-Only include fields you're confident about.`;
+Only include fields you're confident about. Leave marketValue as null (we can't estimate prices without web search).`;
 
     const runEnrich = async (useSearch) => {
       const result = await callClaude([{ role: 'user', content: buildPrompt(useSearch) }], 1500, useSearch ? { useWebSearch: true, maxSearches: hints ? 4 : 3 } : {});
@@ -311,7 +407,7 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
       }
 
       // Add wines immediately with the photo attached
-      const newWines = parsed.wines.map((w, i) => ({
+      const candidateWines = parsed.wines.map((w, i) => ({
         ...w,
         id: Date.now() + Math.random() + i,
         addedAt: new Date().toISOString(),
@@ -319,13 +415,23 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
         labelImage: mode === 'photo' ? processedImages[Math.min(i, processedImages.length - 1)]?.displayDataUrl : null,
         _enriching: true
       }));
-      setWines(prev => [...newWines, ...prev]);
+      // Merge duplicates with existing wines
+      let mergeResult;
+      setWines(prev => {
+        mergeResult = mergeWinesIntoCellar(candidateWines, prev);
+        return mergeResult.wines;
+      });
+      // Wait one tick for state to settle, then show toast
+      setTimeout(() => {
+        if (mergeResult) showMergeToastIfNeeded(mergeResult.merged);
+      }, 100);
       setIsAnalyzing(false);
       setAddMode(null);
       setShowAddMenu(false);
 
-      // Enrich in background, one at a time
-      for (const wine of newWines) {
+      // Enrich in background — only for truly new wines (merged ones already have data)
+      const winesToEnrich = mergeResult ? mergeResult.trulyNew : candidateWines;
+      for (const wine of winesToEnrich) {
         try {
           const extra = await enrichWine(wine);
           setWines(prev => prev.map(w => w.id === wine.id ? { ...w, ...extra, _enriching: false } : w));
@@ -347,7 +453,14 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
     setAnalysisStatus('מעשיר במידע...');
     const extra = await enrichWine(wineData);
     const newWine = { ...wineData, ...extra, id: Date.now() + Math.random(), addedAt: new Date().toISOString() };
-    setWines(prev => [newWine, ...prev]);
+    let mergeResult;
+    setWines(prev => {
+      mergeResult = mergeWinesIntoCellar([newWine], prev);
+      return mergeResult.wines;
+    });
+    setTimeout(() => {
+      if (mergeResult) showMergeToastIfNeeded(mergeResult.merged);
+    }, 100);
     setIsAnalyzing(false);
     setAddMode(null);
     setShowAddMenu(false);
@@ -364,15 +477,26 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
       labelImage,
       _enriching: true
     };
-    setWines(prev => [newWine, ...prev]);
+    let mergeResult;
+    setWines(prev => {
+      mergeResult = mergeWinesIntoCellar([newWine], prev);
+      return mergeResult.wines;
+    });
+    setTimeout(() => {
+      if (mergeResult) showMergeToastIfNeeded(mergeResult.merged);
+    }, 100);
     setAddMode(null);
     setShowAddMenu(false);
 
-    try {
-      const extra = await enrichWine(newWine);
-      setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, ...extra, _enriching: false } : w));
-    } catch (e) {
-      setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, _enriching: false } : w));
+    // Only enrich if this is a truly new wine (wasn't merged into existing)
+    const wasMerged = mergeResult && mergeResult.merged.length > 0;
+    if (!wasMerged) {
+      try {
+        const extra = await enrichWine(newWine);
+        setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, ...extra, _enriching: false } : w));
+      } catch (e) {
+        setWines(prev => prev.map(w => w.id === newWine.id ? { ...w, _enriching: false } : w));
+      }
     }
   };
 
@@ -414,7 +538,14 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
       }
       newWines.push({ ...w, ...extra, id: Date.now() + Math.random() + i, addedAt: new Date().toISOString() });
     }
-    setWines(prev => [...newWines, ...prev]);
+    let mergeResult;
+    setWines(prev => {
+      mergeResult = mergeWinesIntoCellar(newWines, prev);
+      return mergeResult.wines;
+    });
+    setTimeout(() => {
+      if (mergeResult) showMergeToastIfNeeded(mergeResult.merged);
+    }, 100);
     setIsAnalyzing(false);
     setAddMode(null);
     setShowAddMenu(false);
@@ -422,6 +553,11 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
 
   const updateQuantity = (id, delta) => {
     setWines(prev => prev.map(w => w.id === id ? { ...w, quantity: Math.max(0, (w.quantity || 1) + delta) } : w).filter(w => w.quantity > 0));
+  };
+
+  const updateWineFields = (id, fields) => {
+    setWines(prev => prev.map(w => w.id === id ? { ...w, ...fields } : w));
+    if (selectedWine?.id === id) setSelectedWine(p => ({ ...p, ...fields }));
   };
 
   const deleteWine = (id) => {
@@ -540,7 +676,7 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
 
       <main className="max-w-6xl mx-auto px-5 py-6 relative">
         {selectedWine ? (
-          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} onReidentify={() => setWineToReidentify(selectedWine)} onReenrich={() => setWineToReenrich(selectedWine)} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
+          <WineDetail wine={selectedWine} onBack={() => setSelectedWine(null)} onDelete={() => deleteWine(selectedWine.id)} onUpdateQuantity={(d) => { updateQuantity(selectedWine.id, d); setSelectedWine(p => ({ ...p, quantity: Math.max(0, (p.quantity||1)+d) })); }} onReidentify={() => setWineToReidentify(selectedWine)} onReenrich={() => setWineToReenrich(selectedWine)} onUpdateFields={(fields) => updateWineFields(selectedWine.id, fields)} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} />
         ) : view === 'cellar' ? (
           <CellarView wines={filteredWines} allWines={wines} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} sortBy={sortBy} setSortBy={setSortBy} onSelectWine={setSelectedWine} getDrinkStatus={getDrinkStatus} getWineColor={getWineColor} translateType={translateType} onOpenAdd={() => setShowAddMenu(true)} />
         ) : view === 'recommendations' ? (
@@ -609,6 +745,33 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
             onCancel={() => setWineToReenrich(null)}
           />
         </Modal>
+      )}
+
+      {mergeToast && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[calc(100%-32px)] safe-bottom" style={{ animation: 'toastIn 0.3s cubic-bezier(0.2, 0.9, 0.3, 1)' }}>
+          <div className="rounded-2xl p-4 backdrop-blur-2xl border border-white/10 shadow-2xl flex items-start gap-3" style={{ background: 'rgba(29, 29, 31, 0.92)', boxShadow: '0 10px 40px rgba(0,0,0,0.3)' }}>
+            <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style={{ background: '#7ba87b' }}>
+              <Check className="w-4 h-4 text-white" strokeWidth={3} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-white text-[14px] font-semibold mb-1">
+                {mergeToast.items.length === 1 ? 'יין אוחד עם רשומה קיימת' : `${mergeToast.items.length} יינות אוחדו`}
+              </div>
+              <div className="text-white/70 text-[12px] space-y-0.5">
+                {mergeToast.items.slice(0, 3).map((m, i) => (
+                  <div key={i} className="truncate">
+                    {m.name}{m.vintage ? ` ${m.vintage}` : ''} — סה"כ {m.totalQty} בקבוקים
+                  </div>
+                ))}
+                {mergeToast.items.length > 3 && <div>ועוד {mergeToast.items.length - 3}...</div>}
+              </div>
+            </div>
+            <button onClick={() => setMergeToast(null)} className="w-7 h-7 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center shrink-0">
+              <X className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+            </button>
+          </div>
+          <style>{`@keyframes toastIn { from { opacity: 0; transform: translate(-50%, 20px); } to { opacity: 1; transform: translate(-50%, 0); } }`}</style>
+        </div>
       )}
     </div>
   );
@@ -734,16 +897,29 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
           {wine.vintage && <span className="font-medium" style={{ color: colors.accent }}>{wine.vintage}</span>}
           {wine.vintage && wine.type && <span>·</span>}
           {wine.type && <span>{translateType(wine.type)}</span>}
+          {!wine.price && <span className="mr-auto text-[10px] text-gray-300" title="ללא מחיר רכישה">₪?</span>}
         </div>
       </div>
     </button>
   );
 }
 
-function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, onReenrich, getDrinkStatus, getWineColor, translateType }) {
+function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, onReenrich, onUpdateFields, getDrinkStatus, getWineColor, translateType }) {
   const status = getDrinkStatus(wine);
   const colors = getWineColor(wine.type);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [editingPrice, setEditingPrice] = useState(false);
+  const [priceInput, setPriceInput] = useState('');
+  const [priceCurrency, setPriceCurrency] = useState('ILS');
+
+  const savePrice = () => {
+    const val = parseFloat(priceInput);
+    if (!isNaN(val) && val > 0) {
+      onUpdateFields({ price: val, currency: priceCurrency });
+    }
+    setEditingPrice(false);
+    setPriceInput('');
+  };
 
   return (
     <div>
@@ -852,6 +1028,57 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, on
         </div>
       </div>
 
+      {/* Price card — shown when editing, or when price is missing, or when user clicks to edit */}
+      {onUpdateFields && (editingPrice ? (
+        <div className="mb-4 p-4 bg-white/80 backdrop-blur-xl rounded-2xl border border-black/5">
+          <div className="text-[12px] text-gray-500 mb-2">מחיר רכישה</div>
+          <div className="flex gap-2 items-stretch">
+            <input
+              type="number"
+              value={priceInput}
+              onChange={e => setPriceInput(e.target.value)}
+              placeholder="0"
+              autoFocus
+              inputMode="decimal"
+              className="flex-1 h-11 px-3 rounded-xl bg-gray-50 border border-black/5 outline-none focus:border-black/20 text-[15px]"
+            />
+            <select value={priceCurrency} onChange={e => setPriceCurrency(e.target.value)} className="h-11 px-2 rounded-xl bg-gray-50 border border-black/5 outline-none text-[14px]">
+              <option value="ILS">₪</option>
+              <option value="USD">$</option>
+              <option value="EUR">€</option>
+              <option value="GBP">£</option>
+            </select>
+            <button onClick={savePrice} className="px-4 h-11 rounded-xl text-white font-semibold text-[13px]" style={{ background: '#5c1a1b' }}>שמור</button>
+            <button onClick={() => { setEditingPrice(false); setPriceInput(''); }} className="px-3 h-11 rounded-xl bg-gray-100 text-[13px]">ביטול</button>
+          </div>
+        </div>
+      ) : !wine.price ? (
+        <button onClick={() => { setPriceInput(''); setPriceCurrency(wine.currency || 'ILS'); setEditingPrice(true); }} className="w-full mb-4 p-3 bg-white/60 backdrop-blur-xl rounded-2xl border border-dashed border-gray-300 hover:border-gray-400 text-[13px] text-gray-500 hover:text-gray-700 font-medium flex items-center justify-center gap-2 transition-all active:scale-[0.99]">
+          <Plus className="w-4 h-4" strokeWidth={2} />
+          הוסף מחיר רכישה
+        </button>
+      ) : (
+        <div className="mb-4 p-3 bg-white/60 backdrop-blur-xl rounded-2xl border border-black/5 flex items-center justify-between">
+          <div className="text-[13px] text-gray-600">
+            <span className="text-gray-400">מחיר רכישה · </span>
+            <span className="font-semibold" style={{ color: '#1d1d1f' }}>{wine.price} {wine.currency || '₪'}</span>
+          </div>
+          <button onClick={() => { setPriceInput(String(wine.price)); setPriceCurrency(wine.currency || 'ILS'); setEditingPrice(true); }} className="text-[12px] font-medium hover:opacity-70" style={{ color: '#5c1a1b' }}>
+            ערוך
+          </button>
+        </div>
+      ))}
+
+      {wine.marketValue && (
+        <div className="mb-4 p-3 bg-gradient-to-l from-amber-50/60 to-white rounded-2xl border border-amber-100/60 flex items-center justify-between">
+          <div className="text-[13px] text-gray-600">
+            <span className="text-gray-400">שווי שוק נוכחי · </span>
+            <span className="font-semibold" style={{ color: '#1d1d1f' }}>${Math.round(wine.marketValue)}</span>
+          </div>
+          <TrendingUp className="w-4 h-4" style={{ color: '#d4a574' }} strokeWidth={2} />
+        </div>
+      )}
+
       {wine.criticScore && (
         <Section icon={Award} title="ציון מבקרים">
           <div className="flex items-start gap-4">
@@ -904,7 +1131,6 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, on
 
       <div className="mt-6 pt-6 border-t border-black/5 flex items-center justify-between">
         <div className="text-[12px] text-gray-400">
-          {wine.price && <span>נקנה ב-{wine.price} {wine.currency || '₪'} · </span>}
           נוסף {new Date(wine.addedAt).toLocaleDateString('he-IL')}
         </div>
         <button onClick={() => confirmDelete ? onDelete() : setConfirmDelete(true)} className={"text-[13px] font-medium flex items-center gap-1 px-3 py-1.5 rounded-full transition-all " + (confirmDelete ? 'bg-red-500 text-white' : 'text-red-500 hover:bg-red-50')}>
@@ -1084,16 +1310,91 @@ function StatsView({ wines, totalBottles, translateType }) {
   const byType = wines.reduce((acc, w) => { const t = translateType(w.type) || 'אחר'; acc[t] = (acc[t] || 0) + (w.quantity || 1); return acc; }, {});
   const byRegion = wines.reduce((acc, w) => { const r = w.region || 'לא מוגדר'; acc[r] = (acc[r] || 0) + (w.quantity || 1); return acc; }, {});
   const topRegions = Object.entries(byRegion).sort((a,b) => b[1] - a[1]).slice(0, 5);
-  const totalValue = wines.reduce((sum, w) => sum + ((w.price || 0) * (w.quantity || 1)), 0);
   const typeColors = { 'אדום': '#8b2635', 'לבן': '#d4b85a', 'רוזה': '#e89999', 'מבעבע': '#e8d080', 'קינוח': '#a06830', 'מחוזק': '#7a4a20', 'אחר': '#999' };
+
+  // ─── Value calculation ───
+  // USD to ILS approximate conversion (just for display — user's prices may be in ILS already)
+  const USD_TO_ILS = 3.7;
+  const normalizeToILS = (value, currency) => {
+    if (!value) return 0;
+    const c = (currency || 'ILS').toUpperCase();
+    if (c === 'ILS' || c === '₪') return value;
+    if (c === 'USD' || c === '$') return value * USD_TO_ILS;
+    if (c === 'EUR' || c === '€') return value * 4.0;
+    if (c === 'GBP' || c === '£') return value * 4.7;
+    return value;
+  };
+
+  // Cost: what the user paid
+  const totalCost = wines.reduce((sum, w) => sum + normalizeToILS(w.price, w.currency) * (w.quantity || 1), 0);
+  const winesWithPrice = wines.filter(w => w.price).length;
+  const winesMissingPrice = wines.length - winesWithPrice;
+
+  // Market value: sum of marketValue (usually USD) × quantity, converted to ILS
+  const totalMarketValue = wines.reduce((sum, w) => sum + normalizeToILS(w.marketValue, w.marketValueCurrency || 'USD') * (w.quantity || 1), 0);
+  const winesWithMarketValue = wines.filter(w => w.marketValue).length;
+
+  const delta = totalMarketValue - totalCost;
+  const deltaPct = totalCost > 0 ? (delta / totalCost) * 100 : 0;
+  const hasEnoughData = totalCost > 0 && totalMarketValue > 0;
+
+  const formatILS = (n) => '₪' + Math.round(n).toLocaleString();
 
   return (
     <div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+      <div className="grid grid-cols-2 gap-3 mb-3">
         <StatCard label="בקבוקים" value={totalBottles} color="#5c1a1b" />
         <StatCard label="תוויות" value={wines.length} color="#1d1d1f" />
+      </div>
+
+      {/* Value cards */}
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="p-4 bg-white/80 backdrop-blur-xl rounded-2xl border border-black/5">
+          <div className="text-[11px] text-gray-500 font-medium uppercase tracking-wide mb-1">השקעה</div>
+          <div className="text-2xl font-bold" style={{ color: '#1d1d1f' }}>{totalCost ? formatILS(totalCost) : '—'}</div>
+          {winesMissingPrice > 0 && (
+            <div className="text-[11px] text-gray-400 mt-1">
+              {winesMissingPrice} ללא מחיר
+            </div>
+          )}
+        </div>
+        <div className="p-4 bg-white/80 backdrop-blur-xl rounded-2xl border border-black/5">
+          <div className="text-[11px] text-gray-500 font-medium uppercase tracking-wide mb-1">שווי שוק</div>
+          <div className="text-2xl font-bold" style={{ color: '#5c1a1b' }}>{totalMarketValue ? formatILS(totalMarketValue) : '—'}</div>
+          {winesWithMarketValue < wines.length && (
+            <div className="text-[11px] text-gray-400 mt-1">
+              על בסיס {winesWithMarketValue}/{wines.length}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Delta card */}
+      {hasEnoughData && (
+        <div className="p-4 mb-3 rounded-2xl border" style={{
+          background: delta >= 0 ? 'linear-gradient(135deg, rgba(123, 168, 123, 0.08), rgba(123, 168, 123, 0.02))' : 'linear-gradient(135deg, rgba(239, 68, 68, 0.08), rgba(239, 68, 68, 0.02))',
+          borderColor: delta >= 0 ? 'rgba(123, 168, 123, 0.25)' : 'rgba(239, 68, 68, 0.25)'
+        }}>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-[11px] font-medium uppercase tracking-wide mb-0.5" style={{ color: delta >= 0 ? '#5a7c5a' : '#9b2828' }}>
+                {delta >= 0 ? 'רווח פוטנציאלי' : 'ירידה'}
+              </div>
+              <div className="text-xl font-bold" style={{ color: delta >= 0 ? '#5a7c5a' : '#9b2828' }}>
+                {delta >= 0 ? '+' : ''}{formatILS(delta)}
+              </div>
+            </div>
+            <div className="text-left">
+              <div className="text-[22px] font-bold" style={{ color: delta >= 0 ? '#5a7c5a' : '#9b2828' }}>
+                {delta >= 0 ? '↑' : '↓'} {Math.abs(deltaPct).toFixed(1)}%
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-3 mb-5">
         <StatCard label="ציון ממוצע" value={avgScore || '—'} color="#d4a574" />
-        <StatCard label="שווי אוסף" value={totalValue ? totalValue.toLocaleString() : '—'} color="#7ba87b" />
       </div>
 
       {Object.keys(byType).length > 0 && (
