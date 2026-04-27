@@ -635,12 +635,9 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
       <header className="sticky top-0 z-40 backdrop-blur-2xl border-b border-black/5" style={{ background: 'rgba(250, 250, 247, 0.72)' }}>
         <div className="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-full flex items-center justify-center" style={{
-              background: 'linear-gradient(135deg, #5c1a1b, #2a0a0b)',
+            <img src="/icon-180.png" alt="מרתף היין" className="w-9 h-9 rounded-[10px]" style={{
               boxShadow: '0 2px 8px rgba(92, 26, 27, 0.3)'
-            }}>
-              <Wine className="w-5 h-5 text-white" strokeWidth={1.8} />
-            </div>
+            }} />
             <div>
               <h1 className="text-[17px] font-semibold tracking-tight" style={{ color: '#1d1d1f' }}>המרתף שלי</h1>
               <p className="text-[11px] text-gray-500 -mt-0.5">{totalBottles} בקבוקים · {wines.length} תוויות</p>
@@ -781,9 +778,7 @@ function CellarView({ wines, allWines, searchQuery, setSearchQuery, filterType, 
   if (allWines.length === 0) {
     return (
       <div className="text-center py-24">
-        <div className="w-20 h-20 mx-auto mb-6 rounded-full flex items-center justify-center" style={{ background: 'linear-gradient(135deg, rgba(92, 26, 27, 0.08), rgba(92, 26, 27, 0.02))' }}>
-          <Wine className="w-9 h-9" style={{ color: '#5c1a1b' }} strokeWidth={1.5} />
-        </div>
+        <img src="/icon-192.png" alt="מרתף היין" className="w-24 h-24 mx-auto mb-6 rounded-[22px]" style={{ boxShadow: '0 8px 24px rgba(92, 26, 27, 0.18)' }} />
         <h2 className="text-2xl font-semibold mb-2" style={{ color: '#1d1d1f' }}>המרתף שלך מחכה</h2>
         <p className="text-gray-500 mb-6 text-[15px]">הוסף את הבקבוקים הראשונים שלך</p>
         <button onClick={onOpenAdd} className="h-11 px-6 rounded-full text-white text-[15px] font-medium transition-all active:scale-95" style={{
