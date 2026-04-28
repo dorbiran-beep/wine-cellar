@@ -235,6 +235,10 @@ Based on the real data you find, return ONLY valid JSON (no markdown):
   "decant": true/false,
   "marketValue": current average retail price per bottle in USD (number, no currency symbol),
   "marketValueCurrency": "USD",
+  "vintageWeather": "one of: hot, cold, rainy, dry, balanced, challenging — describing the weather of THAT specific vintage in THAT region",
+  "vintageQuality": "one of: exceptional, strong, average, weak — overall vintage quality rating for that region/wine",
+  "agingPotential": "one of: short, medium, long, exceptional — how long this specific vintage can age",
+  "vintageNotes": "1-2 sentences in Hebrew describing the character of this specific vintage in this region and how it affects the wine (e.g. dry summer led to concentrated fruit, cold spring delayed harvest, etc)",
   "_searchSucceeded": true if you found real data, false if you couldn't find this specific wine
 }
 
@@ -243,6 +247,8 @@ CRITICAL:
 - If search finds the wine is different from what user said, use the "corrected*" fields.
 - Set "_searchSucceeded" to false if you couldn't find real info about this specific wine.
 - For marketValue: use the Wine-Searcher aggregate average price for the SPECIFIC vintage if available, otherwise the average across vintages. Number only, in USD.
+- For vintageWeather/vintageQuality/agingPotential: search for vintage reports for that specific year and region. Use Wine Spectator vintage charts, Decanter vintage guides, Wine Enthusiast vintage reports, and producer interviews/journals when available. Examples: "2020 Barolo vintage report", "2018 Bordeaux harvest report Wine Spectator". Read what winemakers themselves said about the season — heat spikes, hail, drought, late ripening, etc. These describe the YEAR not the wine.
+- For vintageNotes: include any colorful detail you find — e.g. "winemakers reported the warmest growing season in 30 years" or "an early frost in April reduced yields by 40%". Quote specific facts when possible, in Hebrew.
 - Only include fields where you have actual data. Omit fields where you're uncertain.`
       : `You are a wine expert. Based on your knowledge, provide information about this wine:
 Wine: ${wine.name}
@@ -264,6 +270,10 @@ Return ONLY valid JSON (no markdown):
   "servingTemp": "serving temp in Celsius",
   "decant": true/false,
   "marketValue": null,
+  "vintageWeather": "hot/cold/rainy/dry/balanced/challenging — only if you know it for that vintage and region",
+  "vintageQuality": "exceptional/strong/average/weak — only if confident",
+  "agingPotential": "short/medium/long/exceptional — only if confident",
+  "vintageNotes": "1-2 sentences in Hebrew about the vintage character if you know it",
   "_searchSucceeded": false
 }
 
@@ -1092,6 +1102,12 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, on
       {(wine.drinkFrom || wine.drinkBy) && (
         <Section icon={Clock} title="חלון שתייה">
           <DrinkingWindow wine={wine} />
+        </Section>
+      )}
+
+      {(wine.vintageWeather || wine.vintageQuality || wine.agingPotential || wine.vintageNotes) && (
+        <Section icon={ThermometerSun} title={"אופי הבציר" + (wine.vintage ? " · " + wine.vintage : "")}>
+          <VintageCharacter wine={wine} />
         </Section>
       )}
 
@@ -2432,6 +2448,74 @@ function ReenrichHelper({ wine, onReenrich, onCancel }) {
           חפש עכשיו
         </button>
       </div>
+    </div>
+  );
+}
+
+// Visual representation of the vintage's character — weather, quality, aging potential
+function VintageCharacter({ wine }) {
+  const weatherMap = {
+    hot: { label: 'חמה', icon: '☀️', color: '#d97706', bg: 'rgba(217, 119, 6, 0.08)' },
+    cold: { label: 'קרירה', icon: '❄️', color: '#0891b2', bg: 'rgba(8, 145, 178, 0.08)' },
+    rainy: { label: 'גשומה', icon: '🌧️', color: '#475569', bg: 'rgba(71, 85, 105, 0.08)' },
+    dry: { label: 'יבשה', icon: '🌾', color: '#a16207', bg: 'rgba(161, 98, 7, 0.08)' },
+    balanced: { label: 'מאוזנת', icon: '🌤️', color: '#7ba87b', bg: 'rgba(123, 168, 123, 0.08)' },
+    challenging: { label: 'מאתגרת', icon: '⛈️', color: '#9b2828', bg: 'rgba(155, 40, 40, 0.08)' }
+  };
+
+  const qualityMap = {
+    exceptional: { label: 'יוצאת דופן', dots: 5, color: '#d4a574' },
+    strong: { label: 'חזקה', dots: 4, color: '#7ba87b' },
+    average: { label: 'בינונית', dots: 3, color: '#94a3b8' },
+    weak: { label: 'חלשה', dots: 2, color: '#a16207' }
+  };
+
+  const agingMap = {
+    short: { label: 'קצר', desc: '5-10 שנים', color: '#94a3b8' },
+    medium: { label: 'בינוני', desc: '10-20 שנים', color: '#7ba87b' },
+    long: { label: 'ארוך', desc: '20-30 שנים', color: '#5c1a1b' },
+    exceptional: { label: 'יוצא דופן', desc: '30+ שנים', color: '#d4a574' }
+  };
+
+  const weather = weatherMap[wine.vintageWeather];
+  const quality = qualityMap[wine.vintageQuality];
+  const aging = agingMap[wine.agingPotential];
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-3 gap-2">
+        {weather && (
+          <div className="rounded-xl p-3 text-center" style={{ background: weather.bg }}>
+            <div className="text-2xl mb-1">{weather.icon}</div>
+            <div className="text-[10px] font-medium uppercase tracking-wide text-gray-500 mb-0.5">מזג אוויר</div>
+            <div className="text-[13px] font-semibold" style={{ color: weather.color }}>{weather.label}</div>
+          </div>
+        )}
+        {quality && (
+          <div className="rounded-xl p-3 text-center" style={{ background: 'rgba(212, 165, 116, 0.06)' }}>
+            <div className="flex items-center justify-center gap-0.5 mb-1 h-7">
+              {[1,2,3,4,5].map(n => (
+                <div key={n} className="w-1.5 h-1.5 rounded-full" style={{
+                  background: n <= quality.dots ? quality.color : '#e5e7eb'
+                }} />
+              ))}
+            </div>
+            <div className="text-[10px] font-medium uppercase tracking-wide text-gray-500 mb-0.5">איכות</div>
+            <div className="text-[13px] font-semibold" style={{ color: quality.color }}>{quality.label}</div>
+          </div>
+        )}
+        {aging && (
+          <div className="rounded-xl p-3 text-center" style={{ background: 'rgba(92, 26, 27, 0.05)' }}>
+            <div className="text-2xl mb-1">⏳</div>
+            <div className="text-[10px] font-medium uppercase tracking-wide text-gray-500 mb-0.5">יישון</div>
+            <div className="text-[13px] font-semibold" style={{ color: aging.color }}>{aging.label}</div>
+            <div className="text-[10px] text-gray-400 mt-0.5">{aging.desc}</div>
+          </div>
+        )}
+      </div>
+      {wine.vintageNotes && (
+        <p className="text-[13px] leading-relaxed text-gray-700 px-1">{wine.vintageNotes}</p>
+      )}
     </div>
   );
 }
