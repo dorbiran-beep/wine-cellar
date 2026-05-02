@@ -13,6 +13,7 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisStatus, setAnalysisStatus] = useState('');
   const [loaded, setLoaded] = useState(false);
+  const [storageWarning, setStorageWarning] = useState(null);
   const [unrecognizedImage, setUnrecognizedImage] = useState(null);
   const [wineToReidentify, setWineToReidentify] = useState(null);
   const [wineToReenrich, setWineToReenrich] = useState(null);
@@ -28,9 +29,40 @@ export default function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try {
-      localStorage.setItem('wine-cellar', JSON.stringify(wines));
-    } catch (e) { console.error('Save failed', e); }
+    const trySave = (data) => {
+      try {
+        localStorage.setItem('wine-cellar', JSON.stringify(data));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    if (trySave(wines)) {
+      // Saved fine - clear any previous warning
+      setStorageWarning(null);
+      return;
+    }
+
+    // Save failed - likely QuotaExceededError. Try saving WITHOUT label images as fallback.
+    console.warn('Storage save failed - attempting without label images');
+    const stripped = wines.map(w => {
+      const { labelImage, ...rest } = w;
+      return rest;
+    });
+    if (trySave(stripped)) {
+      setStorageWarning({
+        message: 'אין מספיק מקום באחסון לתמונות. הנתונים נשמרו ללא תמונות התווית.',
+        severity: 'high'
+      });
+      return;
+    }
+
+    // Even without images we can't save - critical
+    setStorageWarning({
+      message: 'שגיאה בשמירה - האחסון מלא. אנא ייצא את הנתונים ופנה מקום בדפדפן.',
+      severity: 'critical'
+    });
   }, [wines, loaded]);
 
   const [debugInfo, setDebugInfo] = useState(null);
@@ -73,6 +105,61 @@ export default function App() {
   });
 
   // Resize and heavily compress images to stay well under Vercel Hobby plan's 4.5MB request body limit
+  // Crop a region from an image (data URL) using percentage-based bounding box
+  // Returns a small JPEG data URL of just that region
+  const cropImageByBox = (sourceDataUrl, box) => new Promise((resolve, reject) => {
+    if (!box || box.x == null || box.y == null || box.width == null || box.height == null) {
+      resolve(sourceDataUrl); // fallback to full image
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      try {
+        // Convert percentages (0-100) to pixels
+        const sx = Math.max(0, (box.x / 100) * img.width);
+        const sy = Math.max(0, (box.y / 100) * img.height);
+        const sw = Math.min(img.width - sx, (box.width / 100) * img.width);
+        const sh = Math.min(img.height - sy, (box.height / 100) * img.height);
+
+        // Add 5% padding around the box, clamped to image bounds
+        const padX = sw * 0.05;
+        const padY = sh * 0.05;
+        const finalSx = Math.max(0, sx - padX);
+        const finalSy = Math.max(0, sy - padY);
+        const finalSw = Math.min(img.width - finalSx, sw + padX * 2);
+        const finalSh = Math.min(img.height - finalSy, sh + padY * 2);
+
+        // Output dimensions — keep aspect, max 600px on longest side
+        const MAX_OUT = 600;
+        let outW = finalSw, outH = finalSh;
+        if (outW > MAX_OUT || outH > MAX_OUT) {
+          const r = Math.min(MAX_OUT / outW, MAX_OUT / outH);
+          outW = Math.round(outW * r);
+          outH = Math.round(outH * r);
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = outW;
+        canvas.height = outH;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, finalSx, finalSy, finalSw, finalSh, 0, 0, outW, outH);
+
+        let quality = 0.78;
+        let dataUrl = canvas.toDataURL('image/jpeg', quality);
+        while (dataUrl.length > 200_000 && quality > 0.4) {
+          quality -= 0.08;
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
+        resolve(dataUrl);
+      } catch (e) {
+        console.error('crop error', e);
+        resolve(sourceDataUrl);
+      }
+    };
+    img.onerror = () => resolve(sourceDataUrl);
+    img.src = sourceDataUrl;
+  });
+
   const processImageForAPI = (file) => new Promise((resolve, reject) => {
     const MAX_DIM = 1280; // smaller for safer upload size
     const reader = new FileReader();
@@ -368,12 +455,20 @@ IMPORTANT rules:
 - If the label is blurry, occluded, or you can't read the wine name clearly — return confidence:"low" and include any text you CAN see (even partial) in "partialText"
 - Never invent a wine name. If unsure, say so with low confidence.
 - If you recognize the producer/winery but not the specific wine name, still return it with medium confidence
+- For EACH bottle, provide a bounding box (bbox) in PERCENTAGES (0-100) of the image dimensions:
+  * x: distance from left edge as percentage
+  * y: distance from top edge as percentage
+  * width: bottle width as percentage of image width
+  * height: bottle height as percentage of image height
+  * The bbox should tightly fit the entire bottle (from cap to base), centered on the bottle.
 
 Return ONLY valid JSON (no markdown):
-{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית","confidence":"high","partialText":"any text you can read from the label, even if you cant identify the wine"}]}
+{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית","confidence":"high","partialText":"any text you can read","bbox":{"x":12.5,"y":8.0,"width":18.0,"height":85.0}}]}
 
 type must be one of: red, white, rose, sparkling, dessert, fortified.
 confidence must be: "high", "medium", or "low".
+For SINGLE bottle photos: still include bbox covering the bottle (typically near the center).
+For MULTIPLE bottles: each gets its own distinct bbox.
 If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,"partialText":"any text visible on the label"}.`;
 
       const result = await callClaude([{ role: 'user', content: [...imageContents, { type: 'text', text: prompt }] }], 2000);
@@ -416,14 +511,27 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
         return;
       }
 
-      // Add wines immediately with the photo attached
-      const candidateWines = parsed.wines.map((w, i) => ({
-        ...w,
-        id: Date.now() + Math.random() + i,
-        addedAt: new Date().toISOString(),
-        quantity: w.quantity || 1,
-        labelImage: mode === 'photo' ? processedImages[Math.min(i, processedImages.length - 1)]?.displayDataUrl : null,
-        _enriching: true
+      // Build candidates - if mode is photo and we have bboxes, crop each bottle out of the image
+      setAnalysisStatus('מכין תמונות לכל בקבוק...');
+      const candidateWines = await Promise.all(parsed.wines.map(async (w, i) => {
+        let labelImage = null;
+        if (mode === 'photo') {
+          const sourceImage = processedImages[Math.min(i, processedImages.length - 1)]?.displayDataUrl;
+          if (sourceImage) {
+            // Crop to just this bottle if bbox provided, else use full image
+            labelImage = w.bbox ? await cropImageByBox(sourceImage, w.bbox) : sourceImage;
+          }
+        }
+        // Strip bbox out — we don't want to save it on the wine
+        const { bbox, ...wineData } = w;
+        return {
+          ...wineData,
+          id: Date.now() + Math.random() + i,
+          addedAt: new Date().toISOString(),
+          quantity: w.quantity || 1,
+          labelImage,
+          _enriching: true
+        };
       }));
       // Merge duplicates with existing wines
       let mergeResult;
@@ -575,6 +683,76 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
     setSelectedWine(null);
   };
 
+  // ───── Export / Import ─────
+  const exportWines = (includeImages = true) => {
+    const exportData = {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      wineCount: wines.length,
+      wines: includeImages ? wines : wines.map(w => {
+        const { labelImage, ...rest } = w;
+        return rest;
+      })
+    };
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const dateStr = new Date().toISOString().split('T')[0];
+    a.download = `wine-cellar-${dateStr}${includeImages ? '' : '-no-images'}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const importWines = (file, mode) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target.result;
+        const data = JSON.parse(text);
+
+        // Validate
+        if (!data || typeof data !== 'object') throw new Error('הקובץ לא בפורמט תקין');
+        if (!Array.isArray(data.wines)) throw new Error('הקובץ לא מכיל רשימת יינות');
+        if (data.wines.length === 0) throw new Error('הקובץ ריק');
+
+        // Make sure each wine has required fields and a unique ID
+        const importedWines = data.wines.map((w, i) => ({
+          ...w,
+          id: w.id || (Date.now() + Math.random() + i),
+          addedAt: w.addedAt || new Date().toISOString(),
+          quantity: w.quantity || 1
+        }));
+
+        if (mode === 'replace') {
+          // Replace all - clear cellar and use only imported
+          setWines(importedWines);
+          resolve({ added: importedWines.length, merged: 0, replaced: true });
+        } else {
+          // Merge mode - combine with existing using duplicate detection
+          let mergeResult;
+          setWines(prev => {
+            mergeResult = mergeWinesIntoCellar(importedWines, prev);
+            return mergeResult.wines;
+          });
+          setTimeout(() => {
+            resolve({
+              added: mergeResult ? mergeResult.trulyNew.length : importedWines.length,
+              merged: mergeResult ? mergeResult.merged.length : 0,
+              replaced: false
+            });
+          }, 100);
+        }
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.onerror = () => reject(new Error('שגיאה בקריאת הקובץ'));
+    reader.readAsText(file);
+  });
+
   const translateType = (type) => {
     const map = { red: 'אדום', white: 'לבן', rose: 'רוזה', 'rosé': 'רוזה', sparkling: 'מבעבע', dessert: 'קינוח', fortified: 'מחוזק' };
     return map[type?.toLowerCase()] || type;
@@ -689,7 +867,7 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
         ) : view === 'recommendations' ? (
           <RecommendationsView allWines={wines} onSelectWine={setSelectedWine} getWineColor={getWineColor} translateType={translateType} callClaude={callClaude} getDrinkStatus={getDrinkStatus} />
         ) : (
-          <StatsView wines={wines} totalBottles={totalBottles} translateType={translateType} />
+          <StatsView wines={wines} totalBottles={totalBottles} translateType={translateType} onExport={exportWines} onImport={importWines} />
         )}
       </main>
 
@@ -752,6 +930,29 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
             onCancel={() => setWineToReenrich(null)}
           />
         </Modal>
+      )}
+
+      {storageWarning && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[calc(100%-32px)]" style={{ animation: 'toastIn 0.3s cubic-bezier(0.2, 0.9, 0.3, 1)' }}>
+          <div className="rounded-2xl p-4 backdrop-blur-2xl border shadow-2xl flex items-start gap-3" style={{
+            background: storageWarning.severity === 'critical' ? 'rgba(155, 40, 40, 0.95)' : 'rgba(217, 119, 6, 0.95)',
+            borderColor: 'rgba(255,255,255,0.15)',
+            boxShadow: '0 10px 40px rgba(0,0,0,0.3)'
+          }}>
+            <AlertCircle className="w-5 h-5 text-white shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="text-white text-[14px] font-semibold mb-1">
+                {storageWarning.severity === 'critical' ? 'בעיית שמירה' : 'אחסון מתמלא'}
+              </div>
+              <div className="text-white/90 text-[12px] leading-relaxed">
+                {storageWarning.message}
+              </div>
+            </div>
+            <button onClick={() => setStorageWarning(null)} className="w-7 h-7 rounded-full bg-white/15 hover:bg-white/25 flex items-center justify-center shrink-0">
+              <X className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+            </button>
+          </div>
+        </div>
       )}
 
       {mergeToast && (
@@ -1316,7 +1517,7 @@ function RecommendationsView({ allWines, onSelectWine, getWineColor, translateTy
   );
 }
 
-function StatsView({ wines, totalBottles, translateType }) {
+function StatsView({ wines, totalBottles, translateType, onExport, onImport }) {
   const avgScore = wines.length ? Math.round(wines.reduce((s,w) => s+(w.criticScore||0),0) / Math.max(1, wines.filter(w=>w.criticScore).length)) : 0;
   const byType = wines.reduce((acc, w) => { const t = translateType(w.type) || 'אחר'; acc[t] = (acc[t] || 0) + (w.quantity || 1); return acc; }, {});
   const byRegion = wines.reduce((acc, w) => { const r = w.region || 'לא מוגדר'; acc[r] = (acc[r] || 0) + (w.quantity || 1); return acc; }, {});
@@ -1444,7 +1645,141 @@ function StatsView({ wines, totalBottles, translateType }) {
           </div>
         </Section>
       )}
+
+      {(onExport || onImport) && (
+        <BackupSection wines={wines} onExport={onExport} onImport={onImport} />
+      )}
     </div>
+  );
+}
+
+function BackupSection({ wines, onExport, onImport }) {
+  const [importing, setImporting] = useState(false);
+  const [importStatus, setImportStatus] = useState(null);
+  const [pendingFile, setPendingFile] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPendingFile(file);
+    setImportStatus(null);
+    e.target.value = ''; // reset so same file can be picked again
+  };
+
+  const doImport = async (mode) => {
+    if (!pendingFile) return;
+    setImporting(true);
+    setImportStatus(null);
+    try {
+      const result = await onImport(pendingFile, mode);
+      setImportStatus({
+        type: 'success',
+        message: result.replaced
+          ? `הוחלפו כל היינות. נטענו ${result.added} יינות.`
+          : `נוספו ${result.added} יינות חדשים${result.merged > 0 ? `, ${result.merged} אוחדו עם קיימים` : ''}.`
+      });
+      setPendingFile(null);
+      setTimeout(() => setImportStatus(null), 5000);
+    } catch (e) {
+      setImportStatus({ type: 'error', message: 'שגיאה: ' + (e.message || 'לא ניתן לטעון את הקובץ') });
+    }
+    setImporting(false);
+  };
+
+  return (
+    <Section icon={Download} title="גיבוי וסנכרון">
+      <div className="space-y-2">
+        <div className="text-[12px] text-gray-500 leading-relaxed mb-1">
+          ייצא את האוסף לקובץ JSON ושמור באייקלאוד / גוגל דרייב כדי לגבות או להעביר בין מכשירים.
+        </div>
+
+        {/* Export buttons */}
+        <button
+          onClick={() => onExport(true)}
+          disabled={wines.length === 0}
+          className="w-full h-12 rounded-2xl text-white font-semibold text-[14px] transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2"
+          style={{ background: 'linear-gradient(135deg, #5c1a1b, #3a1011)', boxShadow: '0 4px 16px rgba(92, 26, 27, 0.25)' }}
+        >
+          <Download className="w-4 h-4" strokeWidth={2} />
+          ייצא הכל ({wines.length} יינות)
+        </button>
+
+        <button
+          onClick={() => onExport(false)}
+          disabled={wines.length === 0}
+          className="w-full h-10 rounded-xl bg-gray-100 hover:bg-gray-200 text-[12px] font-medium text-gray-700 transition-all disabled:opacity-50"
+        >
+          ייצא ללא תמונות (קובץ קל יותר)
+        </button>
+
+        <div className="h-px bg-gray-100 my-3" />
+
+        {/* Import */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={importing}
+          className="w-full h-11 rounded-2xl bg-white border border-gray-200 hover:border-gray-300 text-[14px] font-medium transition-all active:scale-[0.99] flex items-center justify-center gap-2 disabled:opacity-50"
+          style={{ color: '#5c1a1b' }}
+        >
+          <Upload className="w-4 h-4" strokeWidth={2} />
+          ייבא מקובץ
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json,application/json"
+          onChange={handleFileSelect}
+          className="hidden"
+        />
+
+        {/* Import confirmation panel */}
+        {pendingFile && !importing && (
+          <div className="mt-3 p-3 rounded-xl bg-blue-50 border border-blue-100">
+            <div className="text-[13px] font-semibold text-blue-900 mb-1">
+              קובץ נבחר: {pendingFile.name}
+            </div>
+            <div className="text-[12px] text-blue-800 leading-relaxed mb-3">
+              איך לייבא את היינות?
+            </div>
+            <div className="space-y-1.5">
+              <button
+                onClick={() => doImport('merge')}
+                className="w-full h-10 rounded-lg bg-white hover:bg-blue-50 text-[13px] font-medium border border-blue-200 transition-all"
+                style={{ color: '#1e40af' }}
+              >
+                ✚ הוסף לאוסף (כפילויות יאוחדו)
+              </button>
+              <button
+                onClick={() => doImport('replace')}
+                className="w-full h-10 rounded-lg bg-white hover:bg-red-50 text-[13px] font-medium border border-red-200 transition-all text-red-700"
+              >
+                ↻ החלף את כל האוסף
+              </button>
+              <button
+                onClick={() => { setPendingFile(null); setImportStatus(null); }}
+                className="w-full h-9 rounded-lg text-[12px] text-gray-500"
+              >
+                ביטול
+              </button>
+            </div>
+          </div>
+        )}
+
+        {importing && (
+          <div className="mt-3 p-3 rounded-xl bg-gray-50 flex items-center justify-center gap-2 text-[13px] text-gray-600">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            מייבא...
+          </div>
+        )}
+
+        {importStatus && (
+          <div className={"mt-3 p-3 rounded-xl text-[13px] leading-relaxed " + (importStatus.type === 'success' ? 'bg-green-50 text-green-900 border border-green-100' : 'bg-red-50 text-red-900 border border-red-100')}>
+            {importStatus.message}
+          </div>
+        )}
+      </div>
+    </Section>
   );
 }
 
