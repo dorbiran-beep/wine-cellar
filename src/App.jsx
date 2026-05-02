@@ -14,6 +14,7 @@ export default function App() {
   const [analysisStatus, setAnalysisStatus] = useState('');
   const [loaded, setLoaded] = useState(false);
   const [storageWarning, setStorageWarning] = useState(null);
+  const [installPrompt, setInstallPrompt] = useState(null); // { type: 'ios'|'android'|'desktop', deferredEvent? }
   const [unrecognizedImage, setUnrecognizedImage] = useState(null);
   const [wineToReidentify, setWineToReidentify] = useState(null);
   const [wineToReenrich, setWineToReenrich] = useState(null);
@@ -64,6 +65,91 @@ export default function App() {
       severity: 'critical'
     });
   }, [wines, loaded]);
+
+  // ───── Install prompt logic ─────
+  // Detects platform, listens for native beforeinstallprompt, and decides when to show banner
+  useEffect(() => {
+    if (!loaded) return;
+
+    // Helper: detect if app is already running as installed PWA
+    const isStandalone = () =>
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.navigator.standalone === true;
+
+    // Don't show if already installed
+    if (isStandalone()) return;
+
+    // Detect platform
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPhone|iPad|iPod/.test(ua) && !window.MSStream;
+    const isAndroid = /Android/.test(ua);
+    const isMobile = isIOS || isAndroid;
+
+    // Decide whether enough time has passed since last dismissal
+    const shouldShow = () => {
+      // Don't show until user has added at least one wine
+      if (wines.length === 0) return false;
+
+      const dismissedAt = localStorage.getItem('installPromptDismissedAt');
+      if (dismissedAt) {
+        const days = (Date.now() - parseInt(dismissedAt, 10)) / (1000 * 60 * 60 * 24);
+        if (days < 3) return false;
+      }
+      return true;
+    };
+
+    // For Android Chrome - listen for the native event
+    let deferredEvent = null;
+    const handleBeforeInstall = (e) => {
+      e.preventDefault();
+      deferredEvent = e;
+      if (shouldShow()) {
+        setInstallPrompt({ type: 'android', deferredEvent: e });
+      }
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+
+    // Mark as installed if it happens
+    const handleInstalled = () => {
+      setInstallPrompt(null);
+      localStorage.setItem('installPromptDismissedAt', String(Date.now()));
+    };
+    window.addEventListener('appinstalled', handleInstalled);
+
+    // For iOS we just check after a small delay (no native event)
+    // For Desktop - show bookmark suggestion
+    const timer = setTimeout(() => {
+      if (!shouldShow()) return;
+      if (isIOS) {
+        setInstallPrompt({ type: 'ios' });
+      } else if (!isMobile && !deferredEvent) {
+        // Desktop without install support - show bookmark hint
+        setInstallPrompt({ type: 'desktop' });
+      }
+      // Android case is handled by the event listener above
+    }, 2000);
+
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, [loaded, wines.length]);
+
+  const dismissInstallPrompt = () => {
+    localStorage.setItem('installPromptDismissedAt', String(Date.now()));
+    setInstallPrompt(null);
+  };
+
+  const triggerNativeInstall = async () => {
+    if (installPrompt?.deferredEvent) {
+      installPrompt.deferredEvent.prompt();
+      try {
+        await installPrompt.deferredEvent.userChoice;
+      } catch (e) {}
+      setInstallPrompt(null);
+    }
+  };
 
   const [debugInfo, setDebugInfo] = useState(null);
 
@@ -953,6 +1039,10 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
             </button>
           </div>
         </div>
+      )}
+
+      {installPrompt && (
+        <InstallBanner type={installPrompt.type} onInstall={triggerNativeInstall} onDismiss={dismissInstallPrompt} />
       )}
 
       {mergeToast && (
@@ -2851,6 +2941,76 @@ function VintageCharacter({ wine }) {
       {wine.vintageNotes && (
         <p className="text-[13px] leading-relaxed text-gray-700 px-1">{wine.vintageNotes}</p>
       )}
+    </div>
+  );
+}
+
+// Install / bookmark prompt banner — adapts to platform
+function InstallBanner({ type, onInstall, onDismiss }) {
+  return (
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[calc(100%-32px)] safe-bottom" style={{ animation: 'installIn 0.4s cubic-bezier(0.2, 0.9, 0.3, 1)' }}>
+      <div className="rounded-2xl p-4 backdrop-blur-2xl border shadow-2xl" style={{
+        background: 'rgba(255,255,255,0.97)',
+        borderColor: 'rgba(0,0,0,0.06)',
+        boxShadow: '0 10px 40px rgba(0,0,0,0.18)'
+      }}>
+        <div className="flex items-start gap-3 mb-3">
+          <img src="/icon-180.png" alt="" className="w-11 h-11 rounded-[12px] shrink-0" style={{ boxShadow: '0 2px 8px rgba(92, 26, 27, 0.25)' }} />
+          <div className="flex-1 min-w-0">
+            {type === 'ios' && (
+              <>
+                <div className="text-[14px] font-semibold leading-tight" style={{ color: '#1d1d1f' }}>הוסף למסך הבית</div>
+                <div className="text-[12px] text-gray-500 mt-0.5 leading-relaxed">פתח באפליקציה אישית כמו אפליקציה אמיתית</div>
+              </>
+            )}
+            {type === 'android' && (
+              <>
+                <div className="text-[14px] font-semibold leading-tight" style={{ color: '#1d1d1f' }}>התקן את האפליקציה</div>
+                <div className="text-[12px] text-gray-500 mt-0.5 leading-relaxed">גישה מהירה ממסך הבית בלי דפדפן</div>
+              </>
+            )}
+            {type === 'desktop' && (
+              <>
+                <div className="text-[14px] font-semibold leading-tight" style={{ color: '#1d1d1f' }}>שמור בסימניות</div>
+                <div className="text-[12px] text-gray-500 mt-0.5 leading-relaxed">הוסף את האפליקציה לסימניות לגישה מהירה</div>
+              </>
+            )}
+          </div>
+          <button onClick={onDismiss} className="w-7 h-7 rounded-full bg-gray-100 hover:bg-gray-200 flex items-center justify-center shrink-0 -mt-0.5">
+            <X className="w-3.5 h-3.5 text-gray-500" strokeWidth={2.5} />
+          </button>
+        </div>
+
+        {type === 'ios' && (
+          <div className="rounded-xl bg-gray-50 p-3 text-[12px] text-gray-700 leading-relaxed">
+            <div className="flex items-center gap-2 mb-1.5">
+              <span>1. לחץ על כפתור השיתוף</span>
+              <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" style={{ color: '#5c1a1b' }}>
+                <path d="M12 2v13M7 7l5-5 5 5M5 12v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <div>2. גלול ובחר <span className="font-semibold">"הוסף למסך הבית"</span></div>
+          </div>
+        )}
+
+        {type === 'android' && (
+          <button
+            onClick={onInstall}
+            className="w-full h-11 rounded-xl text-white font-semibold text-[14px] transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+            style={{ background: 'linear-gradient(135deg, #5c1a1b, #3a1011)', boxShadow: '0 4px 16px rgba(92, 26, 27, 0.25)' }}
+          >
+            <Download className="w-4 h-4" strokeWidth={2} />
+            התקן עכשיו
+          </button>
+        )}
+
+        {type === 'desktop' && (
+          <div className="rounded-xl bg-gray-50 p-3 text-[12px] text-gray-700 leading-relaxed">
+            לחץ <span className="font-semibold mx-0.5 px-1.5 py-0.5 rounded bg-white border border-gray-200">Ctrl + D</span> או <span className="font-semibold mx-0.5 px-1.5 py-0.5 rounded bg-white border border-gray-200">⌘ + D</span> כדי להוסיף לסימניות
+          </div>
+        )}
+      </div>
+      <style>{`@keyframes installIn { from { opacity: 0; transform: translate(-50%, 30px); } to { opacity: 1; transform: translate(-50%, 0); } }`}</style>
     </div>
   );
 }
