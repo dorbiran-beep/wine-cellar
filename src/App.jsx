@@ -195,31 +195,36 @@ export default function App() {
   // Returns a small JPEG data URL of just that region
   const cropImageByBox = (sourceDataUrl, box) => new Promise((resolve, reject) => {
     if (!box || box.x == null || box.y == null || box.width == null || box.height == null) {
-      resolve(sourceDataUrl); // fallback to full image
+      resolve(sourceDataUrl);
       return;
     }
     const img = new Image();
     img.onload = () => {
       try {
-        // Convert percentages (0-100) to pixels
         const sx = Math.max(0, (box.x / 100) * img.width);
         const sy = Math.max(0, (box.y / 100) * img.height);
         const sw = Math.min(img.width - sx, (box.width / 100) * img.width);
         const sh = Math.min(img.height - sy, (box.height / 100) * img.height);
 
-        // Add 5% padding around the box, clamped to image bounds
-        const padX = sw * 0.05;
-        const padY = sh * 0.05;
+        // Add 8% padding around the box for context
+        const padX = sw * 0.08;
+        const padY = sh * 0.08;
         const finalSx = Math.max(0, sx - padX);
         const finalSy = Math.max(0, sy - padY);
         const finalSw = Math.min(img.width - finalSx, sw + padX * 2);
         const finalSh = Math.min(img.height - finalSy, sh + padY * 2);
 
-        // Output dimensions — keep aspect, max 600px on longest side
-        const MAX_OUT = 600;
+        // Output: at least 800px on the longest side for good label readability
+        const MIN_OUT = 800;
+        const MAX_OUT = 1200;
         let outW = finalSw, outH = finalSh;
-        if (outW > MAX_OUT || outH > MAX_OUT) {
-          const r = Math.min(MAX_OUT / outW, MAX_OUT / outH);
+        const longest = Math.max(outW, outH);
+        if (longest < MIN_OUT) {
+          const r = MIN_OUT / longest;
+          outW = Math.round(outW * r);
+          outH = Math.round(outH * r);
+        } else if (longest > MAX_OUT) {
+          const r = MAX_OUT / longest;
           outW = Math.round(outW * r);
           outH = Math.round(outH * r);
         }
@@ -228,12 +233,15 @@ export default function App() {
         canvas.width = outW;
         canvas.height = outH;
         const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, finalSx, finalSy, finalSw, finalSh, 0, 0, outW, outH);
 
-        let quality = 0.78;
+        let quality = 0.85;
         let dataUrl = canvas.toDataURL('image/jpeg', quality);
-        while (dataUrl.length > 200_000 && quality > 0.4) {
-          quality -= 0.08;
+        // Allow more bytes per crop now (up to ~400KB) for better quality
+        while (dataUrl.length > 400_000 && quality > 0.55) {
+          quality -= 0.07;
           dataUrl = canvas.toDataURL('image/jpeg', quality);
         }
         resolve(dataUrl);
@@ -247,34 +255,46 @@ export default function App() {
   });
 
   const processImageForAPI = (file) => new Promise((resolve, reject) => {
-    const MAX_DIM = 1280; // smaller for safer upload size
+    const MAX_DIM_API = 1280; // smaller for safer upload size to API
+    const MAX_DIM_CROP = 2400; // larger for better crop quality
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
       img.onload = () => {
-        let { width, height } = img;
-        if (width > MAX_DIM || height > MAX_DIM) {
-          const ratio = Math.min(MAX_DIM / width, MAX_DIM / height);
-          width = Math.round(width * ratio);
-          height = Math.round(height * ratio);
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, width, height);
-        ctx.drawImage(img, 0, 0, width, height);
-        
-        // Try progressively lower quality until under 2MB
-        let quality = 0.82;
-        let dataUrl = canvas.toDataURL('image/jpeg', quality);
-        while (dataUrl.length > 2_800_000 && quality > 0.4) {
-          quality -= 0.1;
-          dataUrl = canvas.toDataURL('image/jpeg', quality);
-        }
-        console.log('Image compressed to', Math.round(dataUrl.length / 1024), 'KB at quality', quality.toFixed(2));
-        resolve({ data: dataUrl.split(',')[1], media_type: 'image/jpeg' });
+        const renderAtSize = (maxDim, qualityStart, sizeLimit) => {
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            const ratio = Math.min(maxDim / width, maxDim / height);
+            width = Math.round(width * ratio);
+            height = Math.round(height * ratio);
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          let quality = qualityStart;
+          let dataUrl = canvas.toDataURL('image/jpeg', quality);
+          while (dataUrl.length > sizeLimit && quality > 0.4) {
+            quality -= 0.1;
+            dataUrl = canvas.toDataURL('image/jpeg', quality);
+          }
+          return { dataUrl, width, height };
+        };
+
+        // For API: small/compressed for upload size
+        const apiVersion = renderAtSize(MAX_DIM_API, 0.82, 2_800_000);
+        // For local crop source: bigger, better quality
+        const cropVersion = renderAtSize(MAX_DIM_CROP, 0.88, 6_000_000);
+
+        console.log('Image processed - API:', Math.round(apiVersion.dataUrl.length / 1024), 'KB,  crop source:', Math.round(cropVersion.dataUrl.length / 1024), 'KB');
+        resolve({
+          data: apiVersion.dataUrl.split(',')[1],
+          media_type: 'image/jpeg',
+          cropSourceDataUrl: cropVersion.dataUrl
+        });
       };
       img.onerror = reject;
       img.src = e.target.result;
@@ -344,23 +364,41 @@ export default function App() {
   };
 
   // Process a batch of new wines, merging duplicates into existing ones.
-  // Returns the updated full wines list, AND info about what was merged.
+  // Merging happens both against existing cellar AND within the batch itself,
+  // but in-batch merging is based on the INITIAL recognition data (before enrichment).
   const mergeWinesIntoCellar = (newWines, existingWines) => {
+    const originalExisting = [...existingWines];
     const finalWines = [...existingWines];
-    const merged = []; // { newName, intoName, addedQty }
+    const merged = [];
     const trulyNew = [];
+    // Track which batch items got merged with each other
+    const batchAdded = []; // refs to wines actually added (for in-batch dedup)
 
     for (const nw of newWines) {
-      const dup = findDuplicate(nw, finalWines);
+      // First check existing cellar
+      let dup = findDuplicate(nw, originalExisting);
       if (dup) {
         const result = addOrMergeWine(nw, finalWines);
         const idx = finalWines.findIndex(w => w.id === dup.id);
         finalWines[idx] = result.wine;
         merged.push({ name: nw.name, vintage: nw.vintage, addedQty: nw.quantity || 1, totalQty: result.wine.quantity });
-      } else {
-        finalWines.unshift(nw); // new at top
-        trulyNew.push(nw);
+        continue;
       }
+      // Then check items already added in this batch
+      dup = findDuplicate(nw, batchAdded);
+      if (dup) {
+        const result = addOrMergeWine(nw, batchAdded);
+        const batchIdx = batchAdded.findIndex(w => w.id === dup.id);
+        batchAdded[batchIdx] = result.wine;
+        const finalIdx = finalWines.findIndex(w => w.id === dup.id);
+        if (finalIdx >= 0) finalWines[finalIdx] = result.wine;
+        merged.push({ name: nw.name, vintage: nw.vintage, addedQty: nw.quantity || 1, totalQty: result.wine.quantity });
+        continue;
+      }
+      // Truly new
+      finalWines.unshift(nw);
+      batchAdded.push(nw);
+      trulyNew.push(nw);
     }
 
     return { wines: finalWines, merged, trulyNew };
@@ -417,7 +455,9 @@ Based on the real data you find, return ONLY valid JSON (no markdown):
 
 CRITICAL:
 - The type (red/white/rose/etc) MUST match reality. Many natural and lesser-known wines are easily misclassified.
-- If search finds the wine is different from what user said, use the "corrected*" fields.
+- ONLY use "correctedName" if you are HIGHLY CONFIDENT the user's name is wrong AND you found a clearly different specific wine. If unsure, OMIT correctedName entirely.
+- ONLY use "correctedProducer" if the user's producer field is clearly wrong (e.g., empty, generic like "Wine", or clearly mistaken). If the user gave a real producer name that matches what you found, OMIT correctedProducer.
+- NEVER guess a wine name or producer. Better to leave fields empty than to fabricate or substitute.
 - Set "_searchSucceeded" to false if you couldn't find real info about this specific wine.
 - For marketValue: use the Wine-Searcher aggregate average price for the SPECIFIC vintage if available, otherwise the average across vintages. Number only, in USD.
 - For vintageWeather/vintageQuality/agingPotential: search for vintage reports for that specific year and region. Use Wine Spectator vintage charts, Decanter vintage guides, Wine Enthusiast vintage reports, and producer interviews/journals when available. Examples: "2020 Barolo vintage report", "2018 Bordeaux harvest report Wine Spectator". Read what winemakers themselves said about the season — heat spikes, hail, drought, late ripening, etc. These describe the YEAR not the wine.
@@ -471,17 +511,33 @@ Only include fields you're confident about. Leave marketValue as null (we can't 
         parsed = await runEnrich(false);
       }
 
-      // Apply corrections if the search found better info
+      // Apply small corrections automatically (type/grape/region/vintage are objective)
+      // But name/producer changes are stored as a pending suggestion for user to approve
       const corrected = {};
-      if (parsed.correctedName) corrected.name = parsed.correctedName;
-      if (parsed.correctedProducer) corrected.producer = parsed.correctedProducer;
       if (parsed.correctedType) corrected.type = parsed.correctedType;
       if (parsed.correctedGrape) corrected.grape = parsed.correctedGrape;
       if (parsed.correctedRegion) corrected.region = parsed.correctedRegion;
       if (parsed.correctedVintage) corrected.vintage = parsed.correctedVintage;
 
+      // Store name/producer suggestions if they differ significantly from original
+      // We compare normalized strings to avoid trivial differences
+      const norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\u0590-\u05FF]+/g, ' ').trim();
+      let pendingCorrection = null;
+      if (parsed.correctedName && norm(parsed.correctedName) !== norm(wine.name)) {
+        pendingCorrection = pendingCorrection || {};
+        pendingCorrection.name = parsed.correctedName;
+        pendingCorrection.originalName = wine.name;
+      }
+      if (parsed.correctedProducer && norm(parsed.correctedProducer) !== norm(wine.producer)) {
+        pendingCorrection = pendingCorrection || {};
+        pendingCorrection.producer = parsed.correctedProducer;
+        pendingCorrection.originalProducer = wine.producer;
+      }
+
       const { correctedName, correctedProducer, correctedType, correctedGrape, correctedRegion, correctedVintage, ...enrichment } = parsed;
-      return { ...corrected, ...enrichment };
+      const result = { ...corrected, ...enrichment };
+      if (pendingCorrection) result.pendingCorrection = pendingCorrection;
+      return result;
     } catch (e) {
       console.warn('Enrichment error:', e);
       return { _searchSucceeded: false };
@@ -507,12 +563,13 @@ Only include fields you're confident about. Leave marketValue as null (we can't 
     setDebugInfo(null);
     setAnalysisStatus(mode === 'invoice' ? 'קורא את החשבונית...' : 'מזהה את הבקבוקים...');
     try {
-      // Process images and keep both the small API version and a display version
+      // Process images: small version for API upload, larger version for cropping
       const processedImages = await Promise.all(Array.from(files).map(async (file) => {
         const processed = await processImageForAPI(file);
         return {
           apiSource: { type: 'base64', media_type: processed.media_type, data: processed.data },
-          displayDataUrl: 'data:image/jpeg;base64,' + processed.data
+          displayDataUrl: 'data:image/jpeg;base64,' + processed.data,
+          cropSourceDataUrl: processed.cropSourceDataUrl
         };
       }));
       const imageContents = processedImages.map(p => ({ type: 'image', source: p.apiSource }));
@@ -541,20 +598,21 @@ IMPORTANT rules:
 - If the label is blurry, occluded, or you can't read the wine name clearly — return confidence:"low" and include any text you CAN see (even partial) in "partialText"
 - Never invent a wine name. If unsure, say so with low confidence.
 - If you recognize the producer/winery but not the specific wine name, still return it with medium confidence
-- For EACH bottle, provide a bounding box (bbox) in PERCENTAGES (0-100) of the image dimensions:
-  * x: distance from left edge as percentage
-  * y: distance from top edge as percentage
-  * width: bottle width as percentage of image width
-  * height: bottle height as percentage of image height
-  * The bbox should tightly fit the entire bottle (from cap to base), centered on the bottle.
+- For EACH bottle, provide a "labelBox" (bounding box of just the LABEL AREA, not the whole bottle) in PERCENTAGES (0-100) of the image dimensions:
+  * x: distance from left edge of image as percentage
+  * y: distance from top edge of image as percentage
+  * width: label width as percentage of image width
+  * height: label height as percentage of image height
+  * The labelBox should tightly enclose just the printed paper label (the rectangular area with the wine name and producer text). Do NOT include the bottle's neck, cap, or empty glass below the label.
+  * For tall narrow labels, height is usually 25-45% of the bottle height. For wide squat labels, smaller height proportion.
 
 Return ONLY valid JSON (no markdown):
-{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית","confidence":"high","partialText":"any text you can read","bbox":{"x":12.5,"y":8.0,"width":18.0,"height":85.0}}]}
+{"wines":[{"name":"Wine Name","producer":"Producer","vintage":2020,"type":"red","grape":"Cabernet Sauvignon","region":"Region, Country","quantity":1,"alcohol":14.5,"description":"תיאור קצר בעברית","confidence":"high","partialText":"any text you can read","labelBox":{"x":12.5,"y":40.0,"width":18.0,"height":25.0}}]}
 
 type must be one of: red, white, rose, sparkling, dessert, fortified.
 confidence must be: "high", "medium", or "low".
-For SINGLE bottle photos: still include bbox covering the bottle (typically near the center).
-For MULTIPLE bottles: each gets its own distinct bbox.
+For SINGLE bottle photos: still include labelBox covering the label area.
+For MULTIPLE bottles: each gets its own distinct labelBox tightly around its label.
 If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,"partialText":"any text visible on the label"}.`;
 
       const result = await callClaude([{ role: 'user', content: [...imageContents, { type: 'text', text: prompt }] }], 2000);
@@ -602,14 +660,15 @@ If you cannot identify any wine at all, return {"wines":[],"noRecognition":true,
       const candidateWines = await Promise.all(parsed.wines.map(async (w, i) => {
         let labelImage = null;
         if (mode === 'photo') {
-          const sourceImage = processedImages[Math.min(i, processedImages.length - 1)]?.displayDataUrl;
+          const imgPair = processedImages[Math.min(i, processedImages.length - 1)];
+          // Use the higher-resolution version for cropping; fall back to display version if not available
+          const sourceImage = imgPair?.cropSourceDataUrl || imgPair?.displayDataUrl;
           if (sourceImage) {
-            // Crop to just this bottle if bbox provided, else use full image
-            labelImage = w.bbox ? await cropImageByBox(sourceImage, w.bbox) : sourceImage;
+            const box = w.labelBox || w.bbox;
+            labelImage = box ? await cropImageByBox(sourceImage, box) : imgPair?.displayDataUrl;
           }
         }
-        // Strip bbox out — we don't want to save it on the wine
-        const { bbox, ...wineData } = w;
+        const { bbox, labelBox, ...wineData } = w;
         return {
           ...wineData,
           id: Date.now() + Math.random() + i,
@@ -1184,6 +1243,11 @@ function WineCard({ wine, onClick, getDrinkStatus, getWineColor, translateType, 
             <span className="text-[10px] font-medium text-white">מעשיר</span>
           </div>
         )}
+        {wine.pendingCorrection && !wine._enriching && (
+          <div className="absolute top-2.5 left-2.5 flex items-center gap-1 px-1.5 py-1 rounded-full backdrop-blur-lg" style={{ background: '#d4a574', boxShadow: '0 2px 6px rgba(212, 165, 116, 0.4)' }} title="יש הצעה לתיקון">
+            <Sparkles className="w-2.5 h-2.5 text-white" strokeWidth={2.5} />
+          </div>
+        )}
       </div>
 
       <div className="p-3">
@@ -1291,6 +1355,64 @@ function WineDetail({ wine, onBack, onDelete, onUpdateQuantity, onReidentify, on
                 <MapPin className="w-3 h-3" /> {wine.region}
               </div>}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pending correction suggestion from enrichment */}
+      {wine.pendingCorrection && onUpdateFields && (
+        <div className="mb-4 p-4 rounded-2xl border" style={{
+          background: 'linear-gradient(135deg, rgba(212, 165, 116, 0.12), rgba(212, 165, 116, 0.04))',
+          borderColor: 'rgba(212, 165, 116, 0.35)'
+        }}>
+          <div className="flex items-start gap-2 mb-3">
+            <div className="w-7 h-7 rounded-full flex items-center justify-center shrink-0 mt-0.5" style={{ background: '#d4a574' }}>
+              <Sparkles className="w-3.5 h-3.5 text-white" strokeWidth={2.5} />
+            </div>
+            <div className="flex-1">
+              <div className="text-[13px] font-semibold mb-1" style={{ color: '#1d1d1f' }}>הצעה לתיקון מהחיפוש</div>
+              <div className="text-[12px] text-gray-700 leading-relaxed">
+                החיפוש מצא יין שונה ממה שזיהיתי. רוצה להחליף?
+              </div>
+            </div>
+          </div>
+          <div className="space-y-1.5 text-[12px] mb-3 mr-9">
+            {wine.pendingCorrection.name && (
+              <div>
+                <span className="text-gray-500">שם:</span>{' '}
+                <span className="line-through text-gray-400">{wine.pendingCorrection.originalName}</span>
+                {' → '}
+                <span className="font-semibold" style={{ color: '#5c1a1b' }}>{wine.pendingCorrection.name}</span>
+              </div>
+            )}
+            {wine.pendingCorrection.producer && (
+              <div>
+                <span className="text-gray-500">יקב:</span>{' '}
+                <span className="line-through text-gray-400">{wine.pendingCorrection.originalProducer}</span>
+                {' → '}
+                <span className="font-semibold" style={{ color: '#5c1a1b' }}>{wine.pendingCorrection.producer}</span>
+              </div>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                const updates = { pendingCorrection: null };
+                if (wine.pendingCorrection.name) updates.name = wine.pendingCorrection.name;
+                if (wine.pendingCorrection.producer) updates.producer = wine.pendingCorrection.producer;
+                onUpdateFields(updates);
+              }}
+              className="flex-1 h-10 rounded-xl text-white font-semibold text-[13px]"
+              style={{ background: 'linear-gradient(135deg, #5c1a1b, #3a1011)' }}
+            >
+              החלף
+            </button>
+            <button
+              onClick={() => onUpdateFields({ pendingCorrection: null })}
+              className="flex-1 h-10 rounded-xl bg-white border border-gray-200 font-medium text-[13px] text-gray-700"
+            >
+              השאר כפי שזיהית
+            </button>
           </div>
         </div>
       )}
